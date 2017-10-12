@@ -204,7 +204,7 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 		return nil, errors.Wrap(err, "create leveled compactor")
 	}
 
-	wal, err := OpenSegmentWAL(filepath.Join(dir, "wal"), l, opts.WALFlushInterval, r)
+	wal, err := OpenSegmentWAL(filepath.Join(dir, "wal"), l, false, opts.WALFlushInterval, r)
 	if err != nil {
 		return nil, err
 	}
@@ -231,6 +231,7 @@ func (db *DB) Dir() string {
 
 func (db *DB) run() {
 	defer close(db.donec)
+	runtime.LockOSThread()
 
 	backoff := time.Duration(0)
 

@@ -23,9 +23,12 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -141,15 +144,13 @@ type RefSample struct {
 // the truncation threshold can be compacted.
 type segmentFile struct {
 	*os.File
-	maxTime   int64  // highest tombstone or sample timpstamp in segment
-	minSeries uint64 // lowerst series ID in segment
+	maxTime int64 // highest tombstone or sample timpstamp in segment
 }
 
 func newSegmentFile(f *os.File) *segmentFile {
 	return &segmentFile{
-		File:      f,
-		maxTime:   math.MinInt64,
-		minSeries: math.MaxUint64,
+		File:    f,
+		maxTime: math.MinInt64,
 	}
 }
 
@@ -182,20 +183,25 @@ type SegmentWAL struct {
 
 	logger        log.Logger
 	flushInterval time.Duration
+	async         bool
 	segmentSize   int64
 
-	crc32 hash.Hash32
-	cur   *bufio.Writer
-	curN  int64
+	cur  *bufio.Writer
+	curN int64
 
-	stopc   chan struct{}
-	donec   chan struct{}
+	stopc       chan struct{}
+	donec       chan struct{}
+	queue       chan *walBuffer
+	byteBuffers sync.Pool
+
+	curBuf unsafe.Pointer
+	// nextBuf unsafe.Pointer
 	buffers sync.Pool
 }
 
 // OpenSegmentWAL opens or creates a write ahead log in the given directory.
 // The WAL must be read completely before new data is written.
-func OpenSegmentWAL(dir string, logger log.Logger, flushInterval time.Duration, r prometheus.Registerer) (*SegmentWAL, error) {
+func OpenSegmentWAL(dir string, logger log.Logger, async bool, flushInterval time.Duration, r prometheus.Registerer) (*SegmentWAL, error) {
 	if err := os.MkdirAll(dir, 0777); err != nil {
 		return nil, err
 	}
@@ -207,14 +213,19 @@ func OpenSegmentWAL(dir string, logger log.Logger, flushInterval time.Duration, 
 		logger = log.NewNopLogger()
 	}
 
+	curBuf := &walBuffer{maxTime: math.MinInt64, buf: &[walBufferSize]byte{}}
+	// nextBuf :=
+
 	w := &SegmentWAL{
 		dirFile:       df,
 		logger:        logger,
+		async:         async,
 		flushInterval: flushInterval,
 		donec:         make(chan struct{}),
 		stopc:         make(chan struct{}),
+		queue:         make(chan *walBuffer, 100),
 		segmentSize:   walSegmentSizeBytes,
-		crc32:         newCRC32(),
+		curBuf:        (unsafe.Pointer)(curBuf),
 	}
 	w.metrics = newWalMetrics(w, r)
 
@@ -230,9 +241,113 @@ func OpenSegmentWAL(dir string, logger log.Logger, flushInterval time.Duration, 
 		w.files = append(w.files, newSegmentFile(f))
 	}
 
-	go w.run(flushInterval)
+	// go w.run()
 
 	return w, nil
+}
+
+func (w *SegmentWAL) getBuffer() *[walBufferSize]byte {
+	if b := w.buffers.Get(); b != nil {
+		return b.(*[walBufferSize]byte)
+	}
+	return &[walBufferSize]byte{}
+}
+
+func (w *SegmentWAL) putBuffer(b *[walBufferSize]byte) {
+	w.buffers.Put(b)
+}
+
+const walBufferSize = 128 * 1024
+
+type walBuffer struct {
+	state   uint64
+	buf     *[walBufferSize]byte
+	maxTime int64
+}
+
+func (b *walBuffer) getState() walBufferState {
+	return walBufferState(atomic.LoadUint64(&b.state))
+}
+
+func (b *walBuffer) setDone(s walBufferState) bool {
+	return atomic.CompareAndSwapUint64(&b.state, uint64(s), uint64(s)|(1<<63))
+}
+
+func (b *walBuffer) reserve(s walBufferState, x int) bool {
+	return atomic.CompareAndSwapUint64(&b.state, uint64(s), uint64(s)+uint64(x<<32))
+}
+
+func (b *walBuffer) release(x int) walBufferState {
+	return walBufferState(atomic.AddUint64(&b.state, uint64(x)))
+}
+
+type walBufferState uint64
+
+func (s walBufferState) done() bool {
+	return s>>63 == 1
+}
+
+func (s walBufferState) reserved() int {
+	return int(s << 1 >> 33)
+}
+
+func (s walBufferState) released() int {
+	return int(s << 32 >> 32)
+}
+
+func (w *SegmentWAL) enqueue(i int, maxt int64, b []byte) func() error {
+	var buf *walBuffer
+	var state walBufferState
+
+	for {
+		buf = (*walBuffer)(atomic.LoadPointer(&w.curBuf))
+		state = buf.getState()
+
+		// Already marked as done and in the process of being swapped. Spin!
+		if state.done() {
+			goto END
+		}
+		// We are exceeding the buffer size; swap the next one in.
+		if res := state.reserved(); res+len(b) > walBufferSize {
+			// If the buffer is still empty, the record will never fit.
+			// XXX(fabxc): handle large records properly.
+			if res == 0 {
+				panic("record too big")
+			}
+			// Mark as done before swapping so no other goroutine attempts adding another entry.
+			if !buf.setDone(state) {
+				goto END
+			}
+			// We only set the done field if the previous state was not done. Thus, if we succeed
+			// we are the first ones and exclusive in updating the current buffer.
+			newBuf := &walBuffer{maxTime: math.MinInt64, buf: w.getBuffer()}
+			atomic.StorePointer(&w.curBuf, unsafe.Pointer(newBuf))
+
+			// If everything was already released when we marked it as done,
+			// we are responsible for shipping the buffer off.
+			if state.released() == state.reserved() {
+				w.queue <- buf
+			}
+			goto END
+		}
+		// Reserve space for ourselves and exit if successful.
+		if buf.reserve(state, len(b)) {
+			break
+		}
+	END:
+		runtime.Gosched()
+	}
+
+	// fmt.Println("copy")
+	copy(buf.buf[state.reserved():], b)
+	state = buf.release(len(b))
+
+	// If we are the last one to release, ship the buffer off. But only if
+	// it was marked as done.
+	if state.released() == state.reserved() && state.done() {
+		w.queue <- buf
+	}
+	return func() error { return nil }
 }
 
 // repairingWALReader wraps a WAL reader and truncates its underlying SegmentWAL after the last
@@ -290,217 +405,6 @@ func (w *SegmentWAL) Reader() WALReader {
 		wal: w,
 		r:   newWALReader(w.files, w.logger),
 	}
-}
-
-func (w *SegmentWAL) getBuffer() *encbuf {
-	b := w.buffers.Get()
-	if b == nil {
-		return &encbuf{b: make([]byte, 0, 64*1024)}
-	}
-	return b.(*encbuf)
-}
-
-func (w *SegmentWAL) putBuffer(b *encbuf) {
-	b.reset()
-	w.buffers.Put(b)
-}
-
-// Truncate deletes the values prior to mint and the series which the keep function
-// does not indiciate to preserve.
-func (w *SegmentWAL) Truncate(mint int64, keep func(uint64) bool) error {
-	// The last segment is always active.
-	if len(w.files) < 2 {
-		return nil
-	}
-	var candidates []*segmentFile
-
-	// All files have to be traversed as there could be two segments for a block
-	// with first block having times (10000, 20000) and SECOND one having (0, 10000).
-	for _, sf := range w.files[:len(w.files)-1] {
-		if sf.maxTime >= mint {
-			break
-		}
-		// Past WAL files are closed. We have to reopen them for another read.
-		f, err := w.openSegmentFile(sf.Name())
-		if err != nil {
-			return errors.Wrap(err, "open old WAL segment for read")
-		}
-		candidates = append(candidates, &segmentFile{
-			File:      f,
-			minSeries: sf.minSeries,
-			maxTime:   sf.maxTime,
-		})
-	}
-	if len(candidates) == 0 {
-		return nil
-	}
-
-	r := newWALReader(candidates, w.logger)
-
-	// Create a new tmp file.
-	f, err := w.createSegmentFile(filepath.Join(w.dirFile.Name(), "compact.tmp"))
-	if err != nil {
-		return errors.Wrap(err, "create compaction segment")
-	}
-	var (
-		csf          = newSegmentFile(f)
-		crc32        = newCRC32()
-		decSeries    = []RefSeries{}
-		activeSeries = []RefSeries{}
-	)
-
-	for r.next() {
-		rt, flag, byt := r.at()
-
-		if rt != WALEntrySeries {
-			continue
-		}
-		decSeries = decSeries[:0]
-		activeSeries = activeSeries[:0]
-
-		err := r.decodeSeries(flag, byt, &decSeries)
-		if err != nil {
-			return errors.Wrap(err, "decode samples while truncating")
-		}
-		for _, s := range decSeries {
-			if keep(s.Ref) {
-				activeSeries = append(activeSeries, s)
-			}
-		}
-
-		buf := w.getBuffer()
-		flag = w.encodeSeries(buf, activeSeries)
-
-		_, err = w.writeTo(csf, crc32, WALEntrySeries, flag, buf.get())
-		w.putBuffer(buf)
-
-		if err != nil {
-			return err
-		}
-	}
-	if r.Err() != nil {
-		return errors.Wrap(r.Err(), "read candidate WAL files")
-	}
-
-	off, err := csf.Seek(0, os.SEEK_CUR)
-	if err != nil {
-		return err
-	}
-	if err := csf.Truncate(off); err != nil {
-		return err
-	}
-	csf.Sync()
-	csf.Close()
-
-	if err := renameFile(csf.Name(), candidates[0].Name()); err != nil {
-		return err
-	}
-	for _, f := range candidates[1:] {
-		if err := os.RemoveAll(f.Name()); err != nil {
-			return errors.Wrap(err, "delete WAL segment file")
-		}
-		f.Close()
-	}
-	if err := w.dirFile.Sync(); err != nil {
-		return err
-	}
-
-	// The file object of csf still holds the name before rename. Recreate it so
-	// subsequent truncations do not look at a non-existant file name.
-	csf.File, err = w.openSegmentFile(candidates[0].Name())
-	if err != nil {
-		return err
-	}
-	// We don't need it to be open.
-	csf.Close()
-
-	w.mtx.Lock()
-	w.files = append([]*segmentFile{csf}, w.files[len(candidates):]...)
-	w.mtx.Unlock()
-
-	return nil
-}
-
-// LogSeries writes a batch of new series labels to the log.
-// The series have to be ordered.
-func (w *SegmentWAL) LogSeries(series []RefSeries) error {
-	buf := w.getBuffer()
-
-	flag := w.encodeSeries(buf, series)
-
-	w.mtx.Lock()
-	defer w.mtx.Unlock()
-
-	err := w.write(WALEntrySeries, flag, buf.get())
-
-	w.putBuffer(buf)
-
-	if err != nil {
-		return errors.Wrap(err, "log series")
-	}
-
-	tf := w.head()
-
-	for _, s := range series {
-		if tf.minSeries > s.Ref {
-			tf.minSeries = s.Ref
-		}
-	}
-	return nil
-}
-
-// LogSamples writes a batch of new samples to the log.
-func (w *SegmentWAL) LogSamples(samples []RefSample) error {
-	buf := w.getBuffer()
-
-	flag := w.encodeSamples(buf, samples)
-
-	w.mtx.Lock()
-	defer w.mtx.Unlock()
-
-	err := w.write(WALEntrySamples, flag, buf.get())
-
-	w.putBuffer(buf)
-
-	if err != nil {
-		return errors.Wrap(err, "log series")
-	}
-	tf := w.head()
-
-	for _, s := range samples {
-		if tf.maxTime < s.T {
-			tf.maxTime = s.T
-		}
-	}
-	return nil
-}
-
-// LogDeletes write a batch of new deletes to the log.
-func (w *SegmentWAL) LogDeletes(stones []Stone) error {
-	buf := w.getBuffer()
-
-	flag := w.encodeDeletes(buf, stones)
-
-	w.mtx.Lock()
-	defer w.mtx.Unlock()
-
-	err := w.write(WALEntryDeletes, flag, buf.get())
-
-	w.putBuffer(buf)
-
-	if err != nil {
-		return errors.Wrap(err, "log series")
-	}
-	tf := w.head()
-
-	for _, s := range stones {
-		for _, iv := range s.intervals {
-			if tf.maxTime < iv.Maxt {
-				tf.maxTime = iv.Maxt
-			}
-		}
-	}
-	return nil
 }
 
 // openSegmentFile opens the given segment file and consumes and validates header.
@@ -655,6 +559,26 @@ func (w *SegmentWAL) flush() error {
 	return w.cur.Flush()
 }
 
+type walByteBuffer struct {
+	crc32   hash.Hash
+	buf     encbuf
+	maxTime int64
+}
+
+func (w *SegmentWAL) getByteBuffer() *walByteBuffer {
+	if b := w.byteBuffers.Get(); b != nil {
+		return b.(*walByteBuffer)
+	}
+	return &walByteBuffer{crc32: newCRC32(), maxTime: math.MinInt64}
+}
+
+func (w *SegmentWAL) putByteBuffer(b *walByteBuffer) {
+	b.crc32.Reset()
+	b.buf.reset()
+	b.maxTime = math.MinInt64
+	w.byteBuffers.Put(b)
+}
+
 func (w *SegmentWAL) run(interval time.Duration) {
 	var tick <-chan time.Time
 
@@ -673,8 +597,239 @@ func (w *SegmentWAL) run(interval time.Duration) {
 			if err := w.Sync(); err != nil {
 				level.Error(w.logger).Log("msg", "sync failed", "err", err)
 			}
+			// case buf := <-w.queue:
+
 		}
 	}
+}
+
+const (
+	walSeriesSimple  = 1
+	walSamplesSimple = 1
+	walDeletesSimple = 1
+)
+
+func (w *SegmentWAL) encodeSeries(b *walByteBuffer, series []RefSeries) {
+	b.buf.putBE32(0)
+	b.buf.putByte(byte(WALEntrySeries))
+	b.buf.putByte(walSeriesSimple)
+
+	for _, s := range series {
+		b.buf.putBE64(s.Ref)
+		b.buf.putUvarint(len(s.Labels))
+
+		for _, l := range s.Labels {
+			b.buf.putUvarintStr(l.Name)
+			b.buf.putUvarintStr(l.Value)
+		}
+	}
+
+	binary.BigEndian.PutUint32(b.buf.b, uint32(b.buf.len()-4))
+	b.buf.putHash(b.crc32)
+}
+
+func (w *SegmentWAL) encodeSamples(b *walByteBuffer, samples []RefSample) {
+	b.buf.putBE32(0)
+	b.buf.putByte(byte(WALEntrySamples))
+	b.buf.putByte(walSamplesSimple)
+
+	// Store base timestamp and base reference number of first sample.
+	// All samples encode their timestamp and ref as delta to those.
+	//
+	// TODO(fabxc): optimize for all samples having the same timestamp.
+	first := samples[0]
+
+	b.buf.putBE64(first.Ref)
+	b.buf.putBE64int64(first.T)
+
+	for _, s := range samples {
+		b.buf.putVarint64(int64(s.Ref) - int64(first.Ref))
+		b.buf.putVarint64(s.T - first.T)
+		b.buf.putBE64(math.Float64bits(s.V))
+
+		if s.T > b.maxTime {
+			b.maxTime = s.T
+		}
+	}
+	binary.BigEndian.PutUint32(b.buf.b, uint32(b.buf.len()-4))
+	b.buf.putHash(b.crc32)
+}
+
+func (w *SegmentWAL) encodeDeletes(b *walByteBuffer, stones []Stone) {
+	b.buf.putBE32(0)
+	b.buf.putByte(byte(WALEntryDeletes))
+	b.buf.putByte(walDeletesSimple)
+
+	for _, s := range stones {
+		for _, iv := range s.intervals {
+			b.buf.putBE64(s.ref)
+			b.buf.putVarint64(iv.Mint)
+			b.buf.putVarint64(iv.Maxt)
+
+			if iv.Maxt > b.maxTime {
+				b.maxTime = iv.Maxt
+			}
+		}
+	}
+	binary.BigEndian.PutUint32(b.buf.b, uint32(b.buf.len()-4))
+	b.buf.putHash(b.crc32)
+}
+
+// LogSeries writes a batch of new series labels to the log.
+// The series have to be ordered.
+func (w *SegmentWAL) LogSeries(series []RefSeries) error {
+	b := w.getByteBuffer()
+	w.encodeSeries(b, series)
+
+	wait := w.enqueue(0, b.maxTime, b.buf.get())
+	w.putByteBuffer(b)
+
+	if w.async {
+		return nil
+	}
+	return wait()
+}
+
+// LogSamples writes a batch of new samples to the log.
+func (w *SegmentWAL) LogSamples(samples []RefSample) error {
+	b := w.getByteBuffer()
+	w.encodeSamples(b, samples)
+
+	wait := w.enqueue(0, b.maxTime, b.buf.get())
+	w.putByteBuffer(b)
+
+	if w.async {
+		return nil
+	}
+	return wait()
+}
+
+// LogDeletes write a batch of new deletes to the log.
+func (w *SegmentWAL) LogDeletes(stones []Stone) error {
+	b := w.getByteBuffer()
+	w.encodeDeletes(b, stones)
+
+	wait := w.enqueue(0, b.maxTime, b.buf.get())
+	w.putByteBuffer(b)
+
+	if w.async {
+		return nil
+	}
+	return wait()
+}
+
+// Truncate deletes the values prior to mint and the series which the keep function
+// does not indiciate to preserve.
+func (w *SegmentWAL) Truncate(mint int64, keep func(uint64) bool) error {
+	// The last segment is always active.
+	if len(w.files) < 2 {
+		return nil
+	}
+	var candidates []*segmentFile
+
+	// All files have to be traversed as there could be two segments for a block
+	// with first block having times (10000, 20000) and SECOND one having (0, 10000).
+	for _, sf := range w.files[:len(w.files)-1] {
+		if sf.maxTime >= mint {
+			break
+		}
+		// Past WAL files are closed. We have to reopen them for another read.
+		f, err := w.openSegmentFile(sf.Name())
+		if err != nil {
+			return errors.Wrap(err, "open old WAL segment for read")
+		}
+		candidates = append(candidates, &segmentFile{
+			File:    f,
+			maxTime: sf.maxTime,
+		})
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	r := newWALReader(candidates, w.logger)
+
+	// Create a new tmp file.
+	f, err := w.createSegmentFile(filepath.Join(w.dirFile.Name(), "compact.tmp"))
+	if err != nil {
+		return errors.Wrap(err, "create compaction segment")
+	}
+	var (
+		csf          = newSegmentFile(f)
+		decSeries    = []RefSeries{}
+		activeSeries = []RefSeries{}
+	)
+
+	for r.next() {
+		rt, flag, byt := r.at()
+
+		if rt != WALEntrySeries {
+			continue
+		}
+		decSeries = decSeries[:0]
+		activeSeries = activeSeries[:0]
+
+		err := r.decodeSeries(flag, byt, &decSeries)
+		if err != nil {
+			return errors.Wrap(err, "decode samples while truncating")
+		}
+		for _, s := range decSeries {
+			if keep(s.Ref) {
+				activeSeries = append(activeSeries, s)
+			}
+		}
+
+		b := w.getByteBuffer()
+		w.encodeSeries(b, activeSeries)
+
+		_, err = csf.Write(b.buf.get())
+		w.putByteBuffer(b)
+
+		if err != nil {
+			return err
+		}
+	}
+	if r.Err() != nil {
+		return errors.Wrap(r.Err(), "read candidate WAL files")
+	}
+
+	off, err := csf.Seek(0, os.SEEK_CUR)
+	if err != nil {
+		return err
+	}
+	if err := csf.Truncate(off); err != nil {
+		return err
+	}
+	csf.Sync()
+	csf.Close()
+
+	if err := renameFile(csf.Name(), candidates[0].Name()); err != nil {
+		return err
+	}
+	for _, f := range candidates[1:] {
+		if err := os.RemoveAll(f.Name()); err != nil {
+			return errors.Wrap(err, "delete WAL segment file")
+		}
+		f.Close()
+	}
+	if err := w.dirFile.Sync(); err != nil {
+		return err
+	}
+
+	// The file object of csf still holds the name before rename. Recreate it so
+	// subsequent truncations do not look at a non-existant file name.
+	csf.File, err = w.openSegmentFile(candidates[0].Name())
+	if err != nil {
+		return err
+	}
+	// We don't need it to be open.
+	csf.Close()
+
+	w.mtx.Lock()
+	w.files = append([]*segmentFile{csf}, w.files[len(candidates):]...)
+	w.mtx.Unlock()
+
+	return nil
 }
 
 // Close syncs all data and closes the underlying resources.
@@ -705,7 +860,7 @@ const (
 	walPageBytes = 16 * minSectorSize
 )
 
-func (w *SegmentWAL) write(t WALEntryType, flag uint8, buf []byte) error {
+func (w *SegmentWAL) write(buf []byte) error {
 	// Cut to the next segment if the entry exceeds the file size unless it would also
 	// exceed the size of a new segment.
 	// TODO(gouthamve): Add a test for this case where the commit is greater than segmentSize.
@@ -720,88 +875,11 @@ func (w *SegmentWAL) write(t WALEntryType, flag uint8, buf []byte) error {
 			return err
 		}
 	}
-	n, err := w.writeTo(w.cur, w.crc32, t, flag, buf)
+	n, err := w.cur.Write(buf)
 
 	w.curN += int64(n)
 
 	return err
-}
-
-func (w *SegmentWAL) writeTo(wr io.Writer, crc32 hash.Hash, t WALEntryType, flag uint8, buf []byte) (int, error) {
-	if len(buf) == 0 {
-		return 0, nil
-	}
-	crc32.Reset()
-	wr = io.MultiWriter(crc32, wr)
-
-	var b [6]byte
-	b[0] = byte(t)
-	b[1] = flag
-
-	binary.BigEndian.PutUint32(b[2:], uint32(len(buf)))
-
-	n1, err := wr.Write(b[:])
-	if err != nil {
-		return n1, err
-	}
-	n2, err := wr.Write(buf)
-	if err != nil {
-		return n1 + n2, err
-	}
-	n3, err := wr.Write(crc32.Sum(b[:0]))
-
-	return n1 + n2 + n3, err
-}
-
-const (
-	walSeriesSimple  = 1
-	walSamplesSimple = 1
-	walDeletesSimple = 1
-)
-
-func (w *SegmentWAL) encodeSeries(buf *encbuf, series []RefSeries) uint8 {
-	for _, s := range series {
-		buf.putBE64(s.Ref)
-		buf.putUvarint(len(s.Labels))
-
-		for _, l := range s.Labels {
-			buf.putUvarintStr(l.Name)
-			buf.putUvarintStr(l.Value)
-		}
-	}
-	return walSeriesSimple
-}
-
-func (w *SegmentWAL) encodeSamples(buf *encbuf, samples []RefSample) uint8 {
-	if len(samples) == 0 {
-		return walSamplesSimple
-	}
-	// Store base timestamp and base reference number of first sample.
-	// All samples encode their timestamp and ref as delta to those.
-	//
-	// TODO(fabxc): optimize for all samples having the same timestamp.
-	first := samples[0]
-
-	buf.putBE64(first.Ref)
-	buf.putBE64int64(first.T)
-
-	for _, s := range samples {
-		buf.putVarint64(int64(s.Ref) - int64(first.Ref))
-		buf.putVarint64(s.T - first.T)
-		buf.putBE64(math.Float64bits(s.V))
-	}
-	return walSamplesSimple
-}
-
-func (w *SegmentWAL) encodeDeletes(buf *encbuf, stones []Stone) uint8 {
-	for _, s := range stones {
-		for _, iv := range s.intervals {
-			buf.putBE64(s.ref)
-			buf.putVarint64(iv.Mint)
-			buf.putVarint64(iv.Maxt)
-		}
-	}
-	return walDeletesSimple
 }
 
 // walReader decodes and emits write ahead log entries.
@@ -904,12 +982,6 @@ func (r *walReader) Read(
 			}
 			datac <- series
 
-			cf := r.current()
-			for _, s := range series {
-				if cf.minSeries > s.Ref {
-					cf.minSeries = s.Ref
-				}
-			}
 		case WALEntrySamples:
 			var samples []RefSample
 			if v := samplePool.Get(); v == nil {
