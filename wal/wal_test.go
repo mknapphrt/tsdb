@@ -27,17 +27,17 @@ func TestWAL_something(t *testing.T) {
 		panic(err)
 	}
 
-	rec := make([]byte, 1234)
+	rec := make([]byte, 2000)
 
 	for i := 0; i < 16; i++ {
 		go func() {
 			for {
-				err := wal.LogAsync(rec)
+				err := wal.Log(rec)
 				if err != nil {
 					fmt.Println(err)
 					os.Exit(1)
 				}
-				time.Sleep(time.Microsecond * 100)
+				// time.Sleep(time.Microsecond * 100)
 			}
 		}()
 	}

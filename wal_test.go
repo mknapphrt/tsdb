@@ -43,11 +43,11 @@ func TestSegmentWAL_enqueue(b *testing.T) {
 
 	var wg sync.WaitGroup
 	// fmt.Println("N", b.N)
-	wg.Add(10000)
-	for i := 0; i < 10000; i++ {
+	wg.Add(32)
+	for i := 0; i < 32; i++ {
 		go func(i int) {
-			for j := 0; j < 100000; j++ {
-				time.Sleep(20 * time.Microsecond)
+			for j := 0; j < 2000000; j++ {
+				time.Sleep(time.Duration(rand.Intn(150)) * time.Microsecond)
 				wal.enqueue(i, 0, make([]byte, 4096))
 			}
 			wg.Done()

@@ -257,7 +257,7 @@ func (w *SegmentWAL) putBuffer(b *[walBufferSize]byte) {
 	w.buffers.Put(b)
 }
 
-const walBufferSize = 128 * 1024
+const walBufferSize = 64 * 1024
 
 type walBuffer struct {
 	state   uint64
@@ -299,13 +299,13 @@ func (w *SegmentWAL) enqueue(i int, maxt int64, b []byte) func() error {
 	var buf *walBuffer
 	var state walBufferState
 
-	for {
+	for k := 0; ; k++ {
 		buf = (*walBuffer)(atomic.LoadPointer(&w.curBuf))
 		state = buf.getState()
 
 		// Already marked as done and in the process of being swapped. Spin!
 		if state.done() {
-			goto END
+			goto RETRY
 		}
 		// We are exceeding the buffer size; swap the next one in.
 		if res := state.reserved(); res+len(b) > walBufferSize {
@@ -316,7 +316,7 @@ func (w *SegmentWAL) enqueue(i int, maxt int64, b []byte) func() error {
 			}
 			// Mark as done before swapping so no other goroutine attempts adding another entry.
 			if !buf.setDone(state) {
-				goto END
+				goto RETRY
 			}
 			// We only set the done field if the previous state was not done. Thus, if we succeed
 			// we are the first ones and exclusive in updating the current buffer.
@@ -328,17 +328,20 @@ func (w *SegmentWAL) enqueue(i int, maxt int64, b []byte) func() error {
 			if state.released() == state.reserved() {
 				w.queue <- buf
 			}
-			goto END
+			goto RETRY
 		}
 		// Reserve space for ourselves and exit if successful.
 		if buf.reserve(state, len(b)) {
 			break
 		}
-	END:
-		runtime.Gosched()
+	RETRY:
+		// This increases the average cycles per call but is still faster by saving
+		// a lot of context switches into the runtime.
+		if k > 2 {
+			runtime.Gosched()
+		}
 	}
 
-	// fmt.Println("copy")
 	copy(buf.buf[state.reserved():], b)
 	state = buf.release(len(b))
 

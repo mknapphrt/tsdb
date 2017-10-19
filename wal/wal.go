@@ -179,6 +179,36 @@ func (w *WAL) run() {
 	}
 }
 
+func (w *WAL) processBlock(blk *block, lastSeq uint64, pending []*block) {
+	// Enqueue if the block is out of order.
+	if blk.seq != lastSeq+1 {
+		pending = append(pending, blk)
+
+		sort.Slice(pending, func(i, j int) bool {
+			return pending[i].seq > pending[j].seq
+		})
+		return
+	}
+
+	// Write current in-order block.
+	_, blk.err = w.file.Write(blk.buf[:])
+	close(blk.done)
+	lastSeq = blk.seq
+
+	// We might be able to work down the pending queue now.
+	for i := len(pending) - 1; i >= 0; i-- {
+		blk = pending[i]
+
+		if blk.seq != lastSeq+1 {
+			break
+		}
+		_, blk.err = w.file.Write(blk.buf[:])
+		close(blk.done)
+		lastSeq = blk.seq
+		pending = pending[:len(pending)-1]
+	}
+}
+
 // processQueue persists enqueued blocks to disk in the order of their sequence number.
 func (w *WAL) processQueue() {
 	defer close(w.donec)
@@ -189,37 +219,14 @@ func (w *WAL) processQueue() {
 
 	c := 0
 
-	for blk := range w.queue {
+	for {
 		c++
 		if c%100000 == 0 {
 			fmt.Println("processed", c)
 		}
-		// Enqueue if the block is out of order.
-		if blk.seq != lastSeq+1 {
-			pending = append(pending, blk)
-
-			sort.Slice(pending, func(i, j int) bool {
-				return pending[i].seq > pending[j].seq
-			})
-			continue
-		}
-
-		// Write current in-order block.
-		_, blk.err = w.file.Write(blk.buf[:])
-		close(blk.done)
-		lastSeq = blk.seq
-
-		// We might be able to work down the pending queue now.
-		for i := len(pending) - 1; i >= 0; i-- {
-			blk = pending[i]
-
-			if blk.seq != lastSeq+1 {
-				break
-			}
-			_, blk.err = w.file.Write(blk.buf[:])
-			close(blk.done)
-			lastSeq = blk.seq
-			pending = pending[:len(pending)-1]
+		select {
+		case blk := <-w.queue:
+			w.processBlock(blk, lastSeq, pending)
 		}
 	}
 }
@@ -302,6 +309,8 @@ func (w *WAL) log(b []byte) func() error {
 	var state blockState
 	var reserved int
 
+	req := len(b) + 8
+
 	for k := 0; ; k++ {
 		blk = (*block)(atomic.LoadPointer(&w.curBlock))
 		state = blk.getState()
@@ -311,9 +320,9 @@ func (w *WAL) log(b []byte) func() error {
 		if state.done() {
 			goto RETRY
 		}
-		if reserved+len(b)+8 <= blockSize {
+		if reserved+req <= blockSize {
 			// Reserve space for ourselves and exit if successful.
-			if blk.reserve(state, len(b)+8) {
+			if blk.reserve(state, req) {
 				break
 			}
 			goto RETRY
@@ -345,18 +354,19 @@ func (w *WAL) log(b []byte) func() error {
 		}
 	}
 
+	// Assemble the record entry and copy it into the reserved space.
 	var lb [5]byte
 	binary.BigEndian.PutUint32(lb[:4], uint32(len(b)))
 	lb[4] = byte(flagFull)
 	off := reserved + 4
 
 	copy(blk.buf[off:], lb[1:])
-	copy(blk.buf[off:], b)
+	copy(blk.buf[off+4:], b)
 
 	crc := crc32.Checksum(blk.buf[off:off+len(b)], castagnoliTable)
 	binary.BigEndian.PutUint32(blk.buf[reserved:], crc)
 
-	state = blk.release(len(b) + 8)
+	state = blk.release(req)
 
 	// If we are the last one to release, ship the buffer off. But only if
 	// it was marked as done.
@@ -413,7 +423,6 @@ func (w *WAL) ReadAll(h func(b []byte) error) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println("readall")
 
 	var (
 		blk  [blockSize]byte
