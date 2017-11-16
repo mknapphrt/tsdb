@@ -66,8 +66,11 @@ func (it *listSeriesIterator) At() (int64, float64) {
 }
 
 func (it *listSeriesIterator) Next() bool {
+	if it.idx == len(it.list)-1 {
+		return false
+	}
 	it.idx++
-	return it.idx < len(it.list)
+	return true
 }
 
 func (it *listSeriesIterator) Seek(t int64) bool {
@@ -128,6 +131,32 @@ func TestMergedSeriesSet(t *testing.T) {
 					"b": "b",
 				}, []sample{
 					{t: 1, v: 1},
+				}),
+			}),
+		},
+		// Merging should ensure monotonicity of timestamps. It's okay to potentially
+		// drop samples in the overlapping range as it just enforces the invariant.
+		{
+			a: newListSeriesSet([]Series{
+				newSeries(map[string]string{
+					"a": "a",
+				}, []sample{
+					{t: 1, v: 1}, {t: 2, v: 2}, {t: 4, v: 4},
+				}),
+			}),
+			b: newListSeriesSet([]Series{
+				newSeries(map[string]string{
+					"a": "a",
+				}, []sample{
+					// (3,3) will be dropped as the first iterator already moves to t=4.
+					{t: 1, v: 1}, {t: 3, v: 3}, {t: 4, v: 4}, {t: 5, v: 5},
+				}),
+			}),
+			exp: newListSeriesSet([]Series{
+				newSeries(map[string]string{
+					"a": "a",
+				}, []sample{
+					{t: 1, v: 1}, {t: 2, v: 2}, {t: 4, v: 4}, {t: 5, v: 5},
 				}),
 			}),
 		},

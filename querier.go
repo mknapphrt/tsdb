@@ -357,9 +357,10 @@ type mergedSeriesSet struct {
 	adone, bdone bool
 }
 
-// NewMergedSeriesSet takes two series sets as a single series set. The input series sets
-// must be sorted and sequential in time, i.e. if they have the same label set,
-// the datapoints of a must be before the datapoints of b.
+// NewMergedSeriesSet takes two series sets as a single series set.
+// Series that occur in both sets should have disjoint time ranges and a should com before b.
+// If the ranges overlap, the result series will still have monotonically increasing timestamps,
+// but all samples in the overlapping range in b will be dropped.
 func NewMergedSeriesSet(a, b SeriesSet) SeriesSet {
 	return newMergedSeriesSet(a, b)
 }
@@ -638,7 +639,9 @@ type SeriesIterator interface {
 }
 
 // chainedSeries implements a series for a list of time-sorted series.
-// They all must have the same labels.
+// They all must have the same labels and should be sequential and disjoint in their
+// time ranges. If they overlap, the overlapping range of the following partial series
+// will be skipped.
 type chainedSeries struct {
 	series []Series
 }
@@ -693,11 +696,13 @@ func (it *chainedSeriesIterator) Next() bool {
 	if it.i == len(it.series)-1 {
 		return false
 	}
+	lastT, _ := it.At()
 
 	it.i++
 	it.cur = it.series[it.i].Iterator()
 
-	return it.Next()
+	// Ensure that we don't jump back in time for overlapping series.
+	return it.cur.Seek(lastT + 1)
 }
 
 func (it *chainedSeriesIterator) At() (t int64, v float64) {
