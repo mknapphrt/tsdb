@@ -797,6 +797,10 @@ func (r *indexReader) Symbols() (map[string]struct{}, error) {
 	return res, nil
 }
 
+func (r *indexReader) SymbolTable() map[uint32]string {
+	return r.symbols
+}
+
 func (r *indexReader) LabelValues(names ...string) (StringTuples, error) {
 	const sep = "\xff"
 
@@ -923,6 +927,24 @@ func (r *indexReader) Postings(name, value string) (Postings, error) {
 
 func (r *indexReader) SortedPostings(p Postings) Postings {
 	return p
+}
+
+// Range is a tuple of start and end that marks a range.
+type Range struct {
+	Start, End int64
+}
+
+func (r *indexReader) PostingsMap() map[labels.Label]Range {
+	res := make(map[labels.Label]Range)
+
+	for ls, off := range r.postings {
+		d := r.decbufAt(int(off))
+		p := strings.SplitN(ls, "\xff", 2)
+		l := labels.Label{Name: p[0], Value: p[1]}
+
+		res[l] = Range{Start: int64(off) + 4, End: int64(off) + 4 + int64(d.len())}
+	}
+	return res
 }
 
 type stringTuples struct {
