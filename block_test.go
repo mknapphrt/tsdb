@@ -16,7 +16,10 @@ package tsdb
 import (
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"testing"
+
+	"github.com/prometheus/tsdb/index"
 )
 
 func TestSetCompactionFailed(t *testing.T) {
@@ -40,7 +43,7 @@ func createEmptyBlock(t *testing.T, dir string) *Block {
 
 	Ok(t, writeMetaFile(dir, &BlockMeta{}))
 
-	ir, err := newIndexWriter(dir)
+	ir, err := index.NewWriter(filepath.Join(dir, indexFilename))
 	Ok(t, err)
 	Ok(t, ir.Close())
 

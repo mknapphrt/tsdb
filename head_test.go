@@ -21,7 +21,8 @@ import (
 	"unsafe"
 
 	"github.com/pkg/errors"
-	"github.com/prometheus/tsdb/chunks"
+	"github.com/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/tsdb/index"
 	"github.com/prometheus/tsdb/labels"
 
 	promlabels "github.com/prometheus/prometheus/pkg/labels"
@@ -147,7 +148,7 @@ func TestHead_ReadWAL(t *testing.T) {
 	require.Equal(t, labels.FromStrings("a", "4"), s50.lset)
 	require.Equal(t, labels.FromStrings("a", "3"), s100.lset)
 
-	expandChunk := func(c chunks.Iterator) (x []sample) {
+	expandChunk := func(c chunkenc.Iterator) (x []sample) {
 		for c.Next() {
 			t, v := c.At()
 			x = append(x, sample{t: t, v: v})
@@ -207,12 +208,12 @@ func TestHead_Truncate(t *testing.T) {
 	require.Nil(t, h.series.getByID(s3.ref))
 	require.Nil(t, h.series.getByID(s4.ref))
 
-	postingsA1, _ := expandPostings(h.postings.get("a", "1"))
-	postingsA2, _ := expandPostings(h.postings.get("a", "2"))
-	postingsB1, _ := expandPostings(h.postings.get("b", "1"))
-	postingsB2, _ := expandPostings(h.postings.get("b", "2"))
-	postingsC1, _ := expandPostings(h.postings.get("c", "1"))
-	postingsAll, _ := expandPostings(h.postings.get("", ""))
+	postingsA1, _ := index.ExpandPostings(h.postings.Get("a", "1"))
+	postingsA2, _ := index.ExpandPostings(h.postings.Get("a", "2"))
+	postingsB1, _ := index.ExpandPostings(h.postings.Get("b", "1"))
+	postingsB2, _ := index.ExpandPostings(h.postings.Get("b", "2"))
+	postingsC1, _ := index.ExpandPostings(h.postings.Get("c", "1"))
+	postingsAll, _ := index.ExpandPostings(h.postings.Get("", ""))
 
 	require.Equal(t, []uint64{s1.ref}, postingsA1)
 	require.Equal(t, []uint64{s2.ref}, postingsA2)
