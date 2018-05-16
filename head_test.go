@@ -14,7 +14,9 @@
 package tsdb
 
 import (
+	"io/ioutil"
 	"math/rand"
+	"os"
 	"testing"
 
 	"github.com/prometheus/tsdb/chunkenc"
@@ -22,6 +24,7 @@ import (
 	"github.com/prometheus/tsdb/index"
 	"github.com/prometheus/tsdb/labels"
 	"github.com/prometheus/tsdb/testutil"
+	"github.com/prometheus/tsdb/wal"
 )
 
 func BenchmarkCreateSeries(b *testing.B) {
@@ -42,27 +45,18 @@ func BenchmarkCreateSeries(b *testing.B) {
 	}
 }
 
-type memoryWAL struct {
-	nopWAL
-	entries []interface{}
-}
-
-func (w *memoryWAL) Reader() WALReader {
-	return w
-}
-
-func (w *memoryWAL) Read(series func([]RefSeries), samples func([]RefSample), deletes func([]Stone)) error {
-	for _, e := range w.entries {
-		switch v := e.(type) {
+func populateTestWAL(t testing.TB, w *wal.WAL, recs []interface{}) {
+	var enc RecordEncoder
+	for _, r := range recs {
+		switch v := r.(type) {
 		case []RefSeries:
-			series(v)
+			testutil.Ok(t, w.Log(enc.Series(v, nil)))
 		case []RefSample:
-			samples(v)
+			testutil.Ok(t, w.Log(enc.Samples(v, nil)))
 		case []Stone:
-			deletes(v)
+			testutil.Ok(t, w.Log(enc.Tombstones(v, nil)))
 		}
 	}
-	return nil
 }
 
 func TestHead_ReadWAL(t *testing.T) {
@@ -85,13 +79,19 @@ func TestHead_ReadWAL(t *testing.T) {
 			{Ref: 50, T: 101, V: 6},
 		},
 	}
-	wal := &memoryWAL{entries: entries}
+	dir, err := ioutil.TempDir("", "test_read_wal")
+	testutil.Ok(t, err)
+	defer os.RemoveAll(dir)
 
-	head, err := NewHead(nil, nil, wal, 1000)
+	w, err := wal.New(nil, nil, dir)
+	testutil.Ok(t, err)
+	populateTestWAL(t, w, entries)
+
+	head, err := NewHead(nil, nil, w, 1000)
 	testutil.Ok(t, err)
 	defer head.Close()
 
-	testutil.Ok(t, head.ReadWAL())
+	testutil.Ok(t, head.Init())
 	testutil.Equals(t, uint64(100), head.lastSeriesID)
 
 	s10 := head.series.getByID(10)
@@ -244,13 +244,19 @@ func TestHeadDeleteSeriesWithoutSamples(t *testing.T) {
 			{Ref: 50, T: 90, V: 1},
 		},
 	}
-	wal := &memoryWAL{entries: entries}
+	dir, err := ioutil.TempDir("", "test_delete_series")
+	testutil.Ok(t, err)
+	defer os.RemoveAll(dir)
 
-	head, err := NewHead(nil, nil, wal, 1000)
+	w, err := wal.New(nil, nil, dir)
+	testutil.Ok(t, err)
+	populateTestWAL(t, w, entries)
+
+	head, err := NewHead(nil, nil, w, 1000)
 	testutil.Ok(t, err)
 	defer head.Close()
 
-	testutil.Ok(t, head.ReadWAL())
+	testutil.Ok(t, head.Init())
 
 	testutil.Ok(t, head.Delete(0, 100, labels.NewEqualMatcher("a", "1")))
 }
@@ -690,7 +696,7 @@ func TestMemSeries_append(t *testing.T) {
 
 func TestGCChunkAccess(t *testing.T) {
 	// Put a chunk, select it. GC it and then access it.
-	h, err := NewHead(nil, nil, NopWAL(), 1000)
+	h, err := NewHead(nil, nil, nil, 1000)
 	testutil.Ok(t, err)
 	defer h.Close()
 
@@ -730,7 +736,7 @@ func TestGCChunkAccess(t *testing.T) {
 
 func TestGCSeriesAccess(t *testing.T) {
 	// Put a series, select it. GC it and then access it.
-	h, err := NewHead(nil, nil, NopWAL(), 1000)
+	h, err := NewHead(nil, nil, nil, 1000)
 	testutil.Ok(t, err)
 	defer h.Close()
 
