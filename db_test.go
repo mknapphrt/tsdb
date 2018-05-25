@@ -18,6 +18,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"testing"
@@ -26,6 +27,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/tsdb/labels"
 	"github.com/prometheus/tsdb/testutil"
+	"github.com/prometheus/tsdb/wal"
 )
 
 func openTestDB(t testing.TB, opts *Options) (db *DB, close func()) {
@@ -1010,4 +1012,110 @@ func TestOverlappingBlocksDetectsAllOverlaps(t *testing.T) {
 		{Min: 5, Max: 6}: {nc1[5], nc1[7]},                                 // 2-6, 5-7
 		{Min: 8, Max: 9}: {nc1[8], nc1[9]},                                 // 7-10, 8-9
 	}, OverlappingBlocks(nc1))
+}
+
+func TestInitializeHeadTimestamp(t *testing.T) {
+	t.Run("clean", func(t *testing.T) {
+		dir, err := ioutil.TempDir("", "test_head_init")
+		testutil.Ok(t, err)
+		defer os.RemoveAll(dir)
+
+		db, err := Open(dir, nil, nil, nil)
+		testutil.Ok(t, err)
+
+		// Should be set to init values if no WAL or blocks exist so far.
+		testutil.Equals(t, int64(math.MaxInt64), db.head.MinTime())
+		testutil.Equals(t, int64(math.MinInt64), db.head.MaxTime())
+
+		// First added sample initializes the writable range.
+		app := db.Appender()
+		_, err = app.Add(labels.FromStrings("a", "b"), 1000, 1)
+		testutil.Ok(t, err)
+
+		testutil.Equals(t, int64(1000), db.head.MinTime())
+		testutil.Equals(t, int64(1000), db.head.MaxTime())
+	})
+	t.Run("wal-only", func(t *testing.T) {
+		dir, err := ioutil.TempDir("", "test_head_init")
+		testutil.Ok(t, err)
+		defer os.RemoveAll(dir)
+
+		testutil.Ok(t, os.MkdirAll(path.Join(dir, "wal"), 0777))
+		w, err := wal.New(nil, nil, path.Join(dir, "wal"))
+		testutil.Ok(t, err)
+
+		var enc RecordEncoder
+		err = w.Log(
+			enc.Series([]RefSeries{
+				{Ref: 123, Labels: labels.FromStrings("a", "1")},
+				{Ref: 124, Labels: labels.FromStrings("a", "2")},
+			}, nil),
+			enc.Samples([]RefSample{
+				{Ref: 123, T: 5000, V: 1},
+				{Ref: 124, T: 15000, V: 1},
+			}, nil),
+		)
+		testutil.Ok(t, err)
+		testutil.Ok(t, w.Close())
+
+		db, err := Open(dir, nil, nil, nil)
+		testutil.Ok(t, err)
+
+		testutil.Equals(t, int64(5000), db.head.MinTime())
+		testutil.Equals(t, int64(15000), db.head.MaxTime())
+	})
+	t.Run("existing-block", func(t *testing.T) {
+		dir, err := ioutil.TempDir("", "test_head_init")
+		testutil.Ok(t, err)
+		defer os.RemoveAll(dir)
+
+		id := ulid.MustNew(2000, nil)
+		createEmptyBlock(t, path.Join(dir, id.String()), &BlockMeta{
+			ULID:    id,
+			MinTime: 1000,
+			MaxTime: 2000,
+		})
+
+		db, err := Open(dir, nil, nil, nil)
+		testutil.Ok(t, err)
+
+		testutil.Equals(t, int64(2000), db.head.MinTime())
+		testutil.Equals(t, int64(2000), db.head.MaxTime())
+	})
+	t.Run("existing-block-and-wal", func(t *testing.T) {
+		dir, err := ioutil.TempDir("", "test_head_init")
+		testutil.Ok(t, err)
+		defer os.RemoveAll(dir)
+
+		id := ulid.MustNew(2000, nil)
+		createEmptyBlock(t, path.Join(dir, id.String()), &BlockMeta{
+			ULID:    id,
+			MinTime: 1000,
+			MaxTime: 6000,
+		})
+
+		testutil.Ok(t, os.MkdirAll(path.Join(dir, "wal"), 0777))
+		w, err := wal.New(nil, nil, path.Join(dir, "wal"))
+		testutil.Ok(t, err)
+
+		var enc RecordEncoder
+		err = w.Log(
+			enc.Series([]RefSeries{
+				{Ref: 123, Labels: labels.FromStrings("a", "1")},
+				{Ref: 124, Labels: labels.FromStrings("a", "2")},
+			}, nil),
+			enc.Samples([]RefSample{
+				{Ref: 123, T: 5000, V: 1},
+				{Ref: 124, T: 15000, V: 1},
+			}, nil),
+		)
+		testutil.Ok(t, err)
+		testutil.Ok(t, w.Close())
+
+		db, err := Open(dir, nil, nil, nil)
+		testutil.Ok(t, err)
+
+		testutil.Equals(t, int64(6000), db.head.MinTime())
+		testutil.Equals(t, int64(15000), db.head.MaxTime())
+	})
 }
