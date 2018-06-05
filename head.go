@@ -183,13 +183,15 @@ func NewHead(r prometheus.Registerer, l log.Logger, wal *wal.WAL, chunkRange int
 		wal:        wal,
 		logger:     l,
 		chunkRange: chunkRange,
-		minTime:    math.MaxInt64,
-		maxTime:    math.MinInt64,
 		series:     newStripeSeries(),
 		values:     map[string]stringset{},
 		symbols:    map[string]struct{}{},
 		postings:   index.NewUnorderedMemPostings(),
 		tombstones: memTombstones{},
+		// Initialize head time range to min/max values so
+		// setting them the first time does not need special handling.
+		minTime: math.MaxInt64,
+		maxTime: math.MinInt64,
 	}
 	h.metrics = newHeadMetrics(h, r)
 
@@ -198,7 +200,7 @@ func NewHead(r prometheus.Registerer, l log.Logger, wal *wal.WAL, chunkRange int
 
 // processWALSamples adds a partition of samples it receives to the head and passes
 // them on to other workers.
-// Samples before the mint timestamp are discarded.
+// Samples before minvalidTime are discarded.
 func (h *Head) processWALSamples(
 	minValidTime int64,
 	partition, total uint64,
@@ -479,7 +481,7 @@ func (h *Head) Truncate(mint int64) error {
 }
 
 // initTime initializes a head with the first timestamp. This only needs to be called
-// for a compltely fresh head with an empty WAL.
+// for a completely fresh head with an empty WAL.
 // Returns true if the initialization took an effect.
 func (h *Head) initTime(t int64) (initialized bool) {
 	if !atomic.CompareAndSwapInt64(&h.minTime, math.MaxInt64, t) {
@@ -596,7 +598,7 @@ func (h *Head) putBytesBuffer(b []byte) {
 type headAppender struct {
 	head         *Head
 	minValidTime int64 // No samples below this timestamp are allowed.
-	mint, maxt   int64
+	mint, maxt   int64 // Time range of samples added with the appender.
 
 	series  []RefSeries
 	samples []RefSample
