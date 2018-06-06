@@ -58,6 +58,9 @@ type Options struct {
 	// Duration of persisted data to keep.
 	RetentionDuration uint64
 
+	// Maximum number of bytes to be retained.
+	MaxBytes int64
+
 	// The sizes of the Blocks.
 	BlockRanges []int64
 
@@ -125,6 +128,8 @@ type dbMetrics struct {
 	cutoffs              prometheus.Counter
 	cutoffsFailed        prometheus.Counter
 	tombCleanTimer       prometheus.Histogram
+	storageBytes         prometheus.Gauge
+	dataLimitDeletions   prometheus.Counter
 }
 
 func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
@@ -162,6 +167,14 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 		Name: "prometheus_tsdb_tombstone_cleanup_seconds",
 		Help: "The time taken to recompact blocks to remove tombstones.",
 	})
+	m.storageBytes = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "prometheus_tsdb_storage_bytes",
+		Help: "The number of bytes that are currently used for local storage.",
+    })
+    m.dataLimitDeletions = prometheus.NewCounter(prometheus.CounterOpts{
+        Name: "prometheus_tsdb_data_limit_deletions",
+        Help: "The number of times that blocks were deleted because the maximum number of bytes was exceeded.",
+    })
 
 	if r != nil {
 		r.MustRegister(
@@ -172,6 +185,8 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 			m.cutoffsFailed,
 			m.compactionsTriggered,
 			m.tombCleanTimer,
+			m.storageBytes,
+			m.dataLimitDeletions,
 		)
 	}
 	return m
@@ -280,6 +295,11 @@ func (db *DB) run() {
 				backoff = 0
 			}
 
+			dataDirSize, err := dirSize(db.dir)
+			if err == nil {
+				db.metrics.storageBytes.Set(float64(dataDirSize))
+			}
+
 		case <-db.stopc:
 			return
 		}
@@ -299,6 +319,22 @@ func (db *DB) beyondRetention(meta *BlockMeta) bool {
 		return false
 	}
 
+	// Size based retention, if MaxBytes is still -1, it has not been set by the user
+	// and only time based retention will be used.
+	var dirsBySize []string
+	if (db.opts.MaxBytes != -1){
+		dirsBySize, err = maxByteCutoffDirs(db.dir, db.opts.MaxBytes, db.metrics)
+		if err != nil {
+			return false, err
+		}
+	}
+
+	if (len(dirsBySize) > 0) {
+        db.metrics.dataLimitDeletions.Inc()
+		level.Warn(db.logger).Log("msg", "data limit was exceeded and records deleted")
+	}
+
+	// Time based retention
 	last := blocks[len(db.blocks)-1]
 	mint := last.Meta().MaxTime - int64(db.opts.RetentionDuration)
 
