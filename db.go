@@ -57,6 +57,9 @@ type Options struct {
 	// Duration of persisted data to keep.
 	RetentionDuration uint64
 
+	// Maximum number of bytes to be retained.
+	MaxBytes int64
+
 	// The sizes of the Blocks.
 	BlockRanges []int64
 
@@ -124,6 +127,8 @@ type dbMetrics struct {
 	cutoffs              prometheus.Counter
 	cutoffsFailed        prometheus.Counter
 	tombCleanTimer       prometheus.Histogram
+	storageBytes         prometheus.Gauge
+	dataLimitDeletions   prometheus.Counter
 }
 
 func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
@@ -161,6 +166,14 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 		Name: "prometheus_tsdb_tombstone_cleanup_seconds",
 		Help: "The time taken to recompact blocks to remove tombstones.",
 	})
+	m.storageBytes = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "prometheus_tsdb_storage_bytes",
+		Help: "The number of bytes that are currently used for local storage.",
+    })
+    m.dataLimitDeletions = prometheus.NewCounter(prometheus.CounterOpts{
+        Name: "prometheus_tsdb_data_limit_deletions",
+        Help: "The number of times that blocks were deleted because the maximum number of bytes was exceeded.",
+    })
 
 	if r != nil {
 		r.MustRegister(
@@ -171,6 +184,8 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 			m.cutoffsFailed,
 			m.compactionsTriggered,
 			m.tombCleanTimer,
+			m.storageBytes,
+			m.dataLimitDeletions,
 		)
 	}
 	return m
@@ -283,6 +298,11 @@ func (db *DB) run() {
 				backoff = 0
 			}
 
+			dataDirSize, err := dirSize(db.dir)
+			if err == nil {
+				db.metrics.storageBytes.Set(float64(dataDirSize))
+			}
+
 		case <-db.stopc:
 			return
 		}
@@ -312,13 +332,32 @@ func (db *DB) retentionCutoff() (b bool, err error) {
 		return false, nil
 	}
 
+	// Size based retention, if MaxBytes is still -1, it has not been set by the user
+	// and only time based retention will be used.
+	var dirsBySize []string
+	if (db.opts.MaxBytes != -1){
+		dirsBySize, err = maxByteCutoffDirs(db.dir, db.opts.MaxBytes, db.metrics)
+		if err != nil {
+			return false, err
+		}
+	}
+
+	if (len(dirsBySize) > 0) {
+        db.metrics.dataLimitDeletions.Inc()
+		level.Warn(db.logger).Log("msg", "data limit was exceeded and records deleted")
+	}
+
+	// Time based retention
 	last := blocks[len(db.blocks)-1]
 
 	mint := last.Meta().MaxTime - int64(db.opts.RetentionDuration)
-	dirs, err := retentionCutoffDirs(db.dir, mint)
+	dirsByTime, err := retentionCutoffDirs(db.dir, mint)
 	if err != nil {
 		return false, err
 	}
+
+	// Remove blocks that fall under either retention criteria
+	dirs := append(dirsBySize, dirsByTime...)
 
 	// This will close the dirs and then delete the dirs.
 	if len(dirs) > 0 {
@@ -458,6 +497,59 @@ func retentionCutoffDirs(dir string, mint int64) ([]string, error) {
 	}
 
 	return delDirs, nil
+}
+
+// maxBytesCutoffDirs returns all the oldest directories that would need to be
+// deleted to maintain the 'MaxBytes' option.
+func maxByteCutoffDirs(dir string, limit int64, metrics *dbMetrics) ([]string, error) {
+	df, err := fileutil.OpenDir(dir)
+	if err != nil {
+		return nil, errors.Wrapf(err, "open directory")
+	}
+	defer df.Close()
+
+	dataDirSize, err := dirSize(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	delDirs := []string{}
+	if (dataDirSize <= limit) {
+		return delDirs, nil
+	}
+	// Limit has been exceeded
+	sizeToDelete := int64(0)
+
+	dirs, err := blockDirs(dir)
+	for _, dir := range dirs {
+
+		size, err := dirSize(dir)
+		if (err != nil){
+			return nil, err
+		}
+
+		delDirs = append(delDirs, dir)
+		sizeToDelete += size
+		// Keep going until the size of the storage folder minus the size of the oldest
+		// blocks is still over the limit.
+		if (dataDirSize - sizeToDelete < limit) {
+			break
+		}
+	}
+
+	return delDirs, nil
+
+}
+
+func dirSize(path string) (int64, error) {
+	var size int64
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if !info.IsDir() {
+			size += int64(info.Size())
+		}
+		return err
+	})
+	return size, err
 }
 
 func (db *DB) getBlock(id ulid.ULID) (*Block, bool) {
