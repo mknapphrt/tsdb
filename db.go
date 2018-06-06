@@ -170,11 +170,11 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 	m.storageBytes = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "prometheus_tsdb_storage_bytes",
 		Help: "The number of bytes that are currently used for local storage.",
-    })
-    m.dataLimitDeletions = prometheus.NewCounter(prometheus.CounterOpts{
-        Name: "prometheus_tsdb_data_limit_deletions",
-        Help: "The number of times that blocks were deleted because the maximum number of bytes was exceeded.",
-    })
+	})
+	m.dataLimitDeletions = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_data_limit_deletions",
+		Help: "The number of times that blocks were deleted because the maximum number of bytes was exceeded.",
+	})
 
 	if r != nil {
 		r.MustRegister(
