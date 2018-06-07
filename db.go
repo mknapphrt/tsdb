@@ -45,7 +45,7 @@ import (
 var DefaultOptions = &Options{
 	WALFlushInterval:  5 * time.Second,
 	RetentionDuration: 15 * 24 * 60 * 60 * 1000, // 15 days in milliseconds
-	MaxBytes:          -1, // Don't use size based retention by default
+	MaxBytes:          0, // Don't use size based retention by default, uses 0 instead of -1 in case it is unintialized
 	BlockRanges:       ExponentialBlockRanges(int64(2*time.Hour)/1e6, 3, 5),
 	NoLockfile:        false,
 }
@@ -336,7 +336,7 @@ func (db *DB) retentionCutoff() (b bool, err error) {
 	// Size based retention, if MaxBytes is still -1, it has not been set by the user
 	// and only time based retention will be used.
 	var dirsBySize []string
-	if (db.opts.MaxBytes != -1){
+	if (db.opts.MaxBytes > 0){
 		dirsBySize, err = maxByteCutoffDirs(db.dir, db.opts.MaxBytes, db.metrics)
 		if err != nil {
 			return false, err
