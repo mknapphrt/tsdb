@@ -173,7 +173,7 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 		Help: "The number of bytes that are currently used for local storage.",
 	})
 	m.dataLimitDeletions = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_data_limit_deletions",
+		Name: "prometheus_tsdb_size_limit_deletions_total",
 		Help: "The number of times that blocks were deleted because the maximum number of bytes was exceeded.",
 	})
 
@@ -320,19 +320,19 @@ func (db *DB) beyondRetention(meta *BlockMeta) bool {
 		return false
 	}
 
-	// Size based retention, if MaxBytes is still -1, it has not been set by the user
-	// and only time based retention will be used.
+	// Size based retention, if MaxBytes is less than or equal to 0,
+	// only time based retention will be used.
 	var dirsBySize []string
-	if (db.opts.MaxBytes > 0){
+	if db.opts.MaxBytes > 0 {
 		dirsBySize, err = maxByteCutoffDirs(db.dir, db.opts.MaxBytes, db.metrics)
 		if err != nil {
 			return false, err
 		}
 	}
 
-	if (len(dirsBySize) > 0) {
-        db.metrics.dataLimitDeletions.Inc()
-		level.Warn(db.logger).Log("msg", "data limit was exceeded and records deleted")
+	if len(dirsBySize) > 0 {
+		msg := fmt.Sprintf("data limit was exceeded and %v records will be deleted", len(dirsBySize))
+		level.Warn(db.logger).Log("msg", msg)
 	}
 
 	// Time based retention
