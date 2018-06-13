@@ -172,7 +172,7 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 		Help: "The number of bytes that are currently used for local storage.",
 	})
 	m.dataLimitDeletions = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_data_limit_deletions",
+		Name: "prometheus_tsdb_size_limit_deletions_total",
 		Help: "The number of times that blocks were deleted because the maximum number of bytes was exceeded.",
 	})
 
@@ -333,19 +333,19 @@ func (db *DB) retentionCutoff() (b bool, err error) {
 		return false, nil
 	}
 
-	// Size based retention, if MaxBytes is still -1, it has not been set by the user
-	// and only time based retention will be used.
+	// Size based retention, if MaxBytes is less than or equal to 0,
+	// only time based retention will be used.
 	var dirsBySize []string
-	if (db.opts.MaxBytes > 0){
+	if db.opts.MaxBytes > 0 {
 		dirsBySize, err = maxByteCutoffDirs(db.dir, db.opts.MaxBytes, db.metrics)
 		if err != nil {
 			return false, err
 		}
 	}
 
-	if (len(dirsBySize) > 0) {
-        db.metrics.dataLimitDeletions.Inc()
-		level.Warn(db.logger).Log("msg", "data limit was exceeded and records deleted")
+	if len(dirsBySize) > 0 {
+		msg := fmt.Sprintf("data limit was exceeded and %v records will be deleted", len(dirsBySize))
+		level.Warn(db.logger).Log("msg", msg)
 	}
 
 	// Time based retention
@@ -363,6 +363,10 @@ func (db *DB) retentionCutoff() (b bool, err error) {
 	// This will close the dirs and then delete the dirs.
 	if len(dirs) > 0 {
 		return true, db.reload(dirs...)
+	}
+
+	if len(dirsBySize) > 0 {
+		db.metrics.dataLimitDeletions.Inc()
 	}
 
 	return false, nil
@@ -514,18 +518,18 @@ func maxByteCutoffDirs(dir string, limit int64, metrics *dbMetrics) ([]string, e
 		return nil, err
 	}
 
-	delDirs := []string{}
-	if (dataDirSize <= limit) {
-		return delDirs, nil
+	if dataDirSize <= limit {
+		return nil, nil
 	}
+
 	// Limit has been exceeded
+	delDirs := []string{}
 	sizeToDelete := int64(0)
 
 	dirs, err := blockDirs(dir)
 	for _, dir := range dirs {
-
 		size, err := dirSize(dir)
-		if (err != nil){
+		if err != nil {
 			return nil, err
 		}
 
@@ -533,7 +537,7 @@ func maxByteCutoffDirs(dir string, limit int64, metrics *dbMetrics) ([]string, e
 		sizeToDelete += size
 		// Keep going until the size of the storage folder minus the size of the oldest
 		// blocks is still over the limit.
-		if (dataDirSize - sizeToDelete < limit) {
+		if dataDirSize - sizeToDelete < limit {
 			break
 		}
 	}
