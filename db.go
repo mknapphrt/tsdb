@@ -45,7 +45,7 @@ import (
 var DefaultOptions = &Options{
 	WALFlushInterval:  5 * time.Second,
 	RetentionDuration: 15 * 24 * 60 * 60 * 1000, // 15 days in milliseconds
-	MaxBytes:          0, // Don't use size based retention by default
+	MaxBytes:          0,                        // Don't use size based retention by default
 	BlockRanges:       ExponentialBlockRanges(int64(2*time.Hour)/1e6, 3, 5),
 	NoLockfile:        false,
 }
@@ -106,8 +106,9 @@ type DB struct {
 	compactor Compactor
 
 	// Mutex for that must be held when modifying the general block layout.
-	mtx    sync.RWMutex
-	blocks []*Block
+	mtx            sync.RWMutex
+	blocks         []*Block
+	blockSizeCache map[ulid.ULID]int64
 
 	head *Head
 
@@ -212,6 +213,7 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 		dir:                dir,
 		logger:             l,
 		opts:               opts,
+		blockSizeCache:     make(map[ulid.ULID]int64),
 		compactc:           make(chan struct{}, 1),
 		donec:              make(chan struct{}),
 		stopc:              make(chan struct{}),
@@ -299,7 +301,7 @@ func (db *DB) run() {
 				backoff = 0
 			}
 
-			dataDirSize, err := dirSize(db.dir)
+			dataDirSize, err := sumStorageSize(db.Dir(), db.blockSizeCache)
 			if err == nil {
 				db.metrics.storageBytes.Set(float64(dataDirSize))
 			}
@@ -337,14 +339,14 @@ func (db *DB) retentionCutoff() (b bool, err error) {
 	// only time based retention will be used.
 	var dirsBySize []string
 	if db.opts.MaxBytes > 0 {
-		dirsBySize, err = maxByteCutoffDirs(db.dir, db.opts.MaxBytes, db.metrics)
+		dirsBySize, err = maxByteCutoffDirs(db.dir, db.opts.MaxBytes, db.blockSizeCache)
 		if err != nil {
 			return false, err
 		}
 	}
 
 	if len(dirsBySize) > 0 {
-		msg := fmt.Sprintf("data limit was exceeded and %v records will be deleted", len(dirsBySize))
+		msg := fmt.Sprintf("data limit was exceeded and %d records will be deleted", len(dirsBySize))
 		level.Warn(db.logger).Log("msg", msg)
 	}
 
@@ -506,18 +508,11 @@ func retentionCutoffDirs(dir string, mint int64) ([]string, error) {
 
 // maxBytesCutoffDirs returns all the oldest directories that would need to be
 // deleted to maintain the 'MaxBytes' option.
-func maxByteCutoffDirs(dir string, limit int64, metrics *dbMetrics) ([]string, error) {
-	df, err := fileutil.OpenDir(dir)
-	if err != nil {
-		return nil, errors.Wrapf(err, "open directory")
-	}
-	defer df.Close()
-
-	dataDirSize, err := dirSize(dir)
+func maxByteCutoffDirs(dir string, limit int64, blockSizeCache map[ulid.ULID]int64) ([]string, error) {
+	dataDirSize, err := sumStorageSize(dir, blockSizeCache)
 	if err != nil {
 		return nil, err
 	}
-
 	if dataDirSize <= limit {
 		return nil, nil
 	}
@@ -528,16 +523,17 @@ func maxByteCutoffDirs(dir string, limit int64, metrics *dbMetrics) ([]string, e
 
 	dirs, err := blockDirs(dir)
 	for _, dir := range dirs {
-		size, err := dirSize(dir)
+		meta, err := readMetaFile(dir)
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "find blocks")
 		}
+		size := blockSizeCache[meta.ULID]
 
 		delDirs = append(delDirs, dir)
 		sizeToDelete += size
 		// Keep going until the size of the storage folder minus the size of the oldest
 		// blocks is still over the limit.
-		if dataDirSize - sizeToDelete < limit {
+		if dataDirSize-sizeToDelete < limit {
 			break
 		}
 	}
@@ -546,6 +542,7 @@ func maxByteCutoffDirs(dir string, limit int64, metrics *dbMetrics) ([]string, e
 
 }
 
+// dirSize calculates the size of a directory and it's subdirectories using stat
 func dirSize(path string) (int64, error) {
 	var size int64
 	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
@@ -555,6 +552,27 @@ func dirSize(path string) (int64, error) {
 		return err
 	})
 	return size, err
+}
+
+// sumStorageSize adds up all the block sizes and the wal to give the total storage size
+func sumStorageSize(dir string, blockSizeCache map[ulid.ULID]int64) (int64, error) {
+	walDir := filepath.Join(dir, "wal")
+	df, err := fileutil.OpenDir(walDir)
+	if err != nil {
+		return -1, errors.Wrapf(err, "open directory")
+	}
+	defer df.Close()
+
+	dataDirSize, err := dirSize(walDir)
+	if err != nil {
+		return -1, err
+	}
+
+	//Add the blocks sizes to the size of the wal to get total storage size
+	for _, v := range blockSizeCache {
+		dataDirSize += v
+	}
+	return dataDirSize, nil
 }
 
 func (db *DB) getBlock(id ulid.ULID) (*Block, bool) {
@@ -594,6 +612,7 @@ func (db *DB) reload(deleteable ...string) (err error) {
 		exist  = map[ulid.ULID]struct{}{}
 	)
 
+	tempCache := make(map[ulid.ULID]int64)
 	for _, dir := range dirs {
 		meta, err := readMetaFile(dir)
 		if err != nil {
@@ -602,6 +621,15 @@ func (db *DB) reload(deleteable ...string) (err error) {
 		// If the block is pending for deletion, don't add it to the new block set.
 		if stringsContain(deleteable, dir) {
 			continue
+		}
+
+		// If a block size is already known, don't recalculate it
+		if _, ok := db.blockSizeCache[meta.ULID]; !ok {
+			if size, err := dirSize(dir); err == nil {
+				tempCache[meta.ULID] = size
+			}
+		} else {
+			tempCache[meta.ULID] = db.blockSizeCache[meta.ULID]
 		}
 
 		b, ok := db.getBlock(meta.ULID)
@@ -615,6 +643,7 @@ func (db *DB) reload(deleteable ...string) (err error) {
 		blocks = append(blocks, b)
 		exist[meta.ULID] = struct{}{}
 	}
+	db.blockSizeCache = tempCache
 	sort.Slice(blocks, func(i, j int) bool {
 		return blocks[i].Meta().MinTime < blocks[j].Meta().MinTime
 	})
