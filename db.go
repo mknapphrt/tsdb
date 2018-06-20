@@ -46,7 +46,7 @@ import (
 var DefaultOptions = &Options{
 	WALFlushInterval:  5 * time.Second,
 	RetentionDuration: 15 * 24 * 60 * 60 * 1000, // 15 days in milliseconds
-	MaxBytes:          0, // Don't use size based retention by default
+	MaxBytes:          0,                        // Don't use size based retention by default
 	BlockRanges:       ExponentialBlockRanges(int64(2*time.Hour)/1e6, 3, 5),
 	NoLockfile:        false,
 }
@@ -107,8 +107,9 @@ type DB struct {
 	compactor Compactor
 
 	// Mutex for that must be held when modifying the general block layout.
-	mtx    sync.RWMutex
-	blocks []*Block
+	mtx            sync.RWMutex
+	blocks         []*Block
+	blockSizeCache map[ulid.ULID]int64
 
 	head *Head
 
@@ -217,6 +218,7 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 		dir:                dir,
 		logger:             l,
 		opts:               opts,
+		blockSizeCache:     make(map[ulid.ULID]int64),
 		compactc:           make(chan struct{}, 1),
 		donec:              make(chan struct{}),
 		stopc:              make(chan struct{}),
@@ -296,7 +298,7 @@ func (db *DB) run() {
 				backoff = 0
 			}
 
-			dataDirSize, err := dirSize(db.dir)
+			dataDirSize, err := sumStorageSize(db.Dir(), db.blockSizeCache)
 			if err == nil {
 				db.metrics.storageBytes.Set(float64(dataDirSize))
 			}
@@ -324,14 +326,14 @@ func (db *DB) beyondRetention(meta *BlockMeta) bool {
 	// only time based retention will be used.
 	var dirsBySize []string
 	if db.opts.MaxBytes > 0 {
-		dirsBySize, err = maxByteCutoffDirs(db.dir, db.opts.MaxBytes, db.metrics)
+		dirsBySize, err = maxByteCutoffDirs(db.dir, db.opts.MaxBytes, db.blockSizeCache)
 		if err != nil {
 			return false, err
 		}
 	}
 
 	if len(dirsBySize) > 0 {
-		msg := fmt.Sprintf("data limit was exceeded and %v records will be deleted", len(dirsBySize))
+		msg := fmt.Sprintf("data limit was exceeded and %d records will be deleted", len(dirsBySize))
 		level.Warn(db.logger).Log("msg", msg)
 	}
 
@@ -540,6 +542,7 @@ func (db *DB) reload() (err error) {
 		blocks = append(blocks, b)
 		opened[meta.ULID] = struct{}{}
 	}
+	db.blockSizeCache = tempCache
 	sort.Slice(blocks, func(i, j int) bool {
 		return blocks[i].Meta().MinTime < blocks[j].Meta().MinTime
 	})
