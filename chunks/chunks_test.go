@@ -24,5 +24,5 @@ func TestReaderWithInvalidBuffer(t *testing.T) {
 	r := &Reader{bs: []ByteSlice{b}}
 
 	_, err := r.Chunk(0)
-	testutil.NotOk(t, err
+	testutil.NotOk(t, err)
 }
