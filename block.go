@@ -162,7 +162,7 @@ type BlockStats struct {
 	NumSeries     uint64 `json:"numSeries,omitempty"`
 	NumChunks     uint64 `json:"numChunks,omitempty"`
 	NumTombstones uint64 `json:"numTombstones,omitempty"`
-	NumBytes      int64  `json:"-"`
+	NumBytes      int64  `json:"numBytes,omitempty"`
 }
 
 // BlockDesc describes a block by ULID and time range.
