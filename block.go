@@ -172,13 +172,6 @@ type BlockDesc struct {
 	MaxTime int64     `json:"maxTime"`
 }
 
-// BlockDesc describes a block by ULID and time range.
-type BlockDesc struct {
-	ULID    ulid.ULID `json:"ulid"`
-	MinTime int64     `json:"minTime"`
-	MaxTime int64     `json:"maxTime"`
-}
-
 // BlockMetaCompaction holds information about compactions a block went through.
 type BlockMetaCompaction struct {
 	// Maximum number of compaction cycles any source block has
