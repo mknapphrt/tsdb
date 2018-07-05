@@ -58,7 +58,7 @@ type Options struct {
 	// Duration of persisted data to keep.
 	RetentionDuration uint64
 
-	// Maximum number of bytes to be retained.
+	// Maximum number of bytes in blocks to be retained.
 	MaxBytes int64
 
 	// The sizes of the Blocks.
@@ -79,7 +79,7 @@ type Appender interface {
 	// Returned reference numbers are ephemeral and may be rejected in calls
 	// to AddFast() at any point. Adding the sample via Add() returns a new
 	// reference number.
-	// If the reference is the empty string it must not be used for caching.
+	// If the reference is 0 it must not be used for caching.
 	Add(l labels.Labels, t int64, v float64) (uint64, error)
 
 	// Add adds a sample pair for the referenced series. It is generally faster
@@ -108,8 +108,6 @@ type DB struct {
 	// Mutex for that must be held when modifying the general block layout.
 	mtx    sync.RWMutex
 	blocks []*Block
-	//	blockSizeCache map[ulid.ULID]int64
-	blockSizeTotal int64
 
 	head *Head
 
@@ -170,7 +168,7 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 		Help: "The time taken to recompact blocks to remove tombstones.",
 	})
 	m.storageBytes = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "prometheus_tsdb_storage_bytes",
+		Name: "prometheus_tsdb_storage_blocks_bytes",
 		Help: "The number of bytes that are currently used for local storage.",
 	})
 	m.dataLimitDeletions = prometheus.NewCounter(prometheus.CounterOpts{
@@ -285,42 +283,22 @@ func (db *DB) run() {
 		case <-db.compactc:
 			db.metrics.compactionsTriggered.Inc()
 
-			_, err1 := db.retentionCutoff()
-			if err1 != nil {
-				level.Error(db.logger).Log("msg", "retention cutoff failed", "err", err1)
-			}
-
-			_, err2 := db.compact()
-			if err2 != nil {
-				level.Error(db.logger).Log("msg", "compaction failed", "err", err2)
-			}
-
-			if err1 != nil || err2 != nil {
+			_, err := db.compact()
+			if err != nil {
+				level.Error(db.logger).Log("msg", "compaction failed", "err", err)
 				backoff = exponential(backoff, 1*time.Second, 1*time.Minute)
 			} else {
 				backoff = 0
 			}
-
-			db.metrics.storageBytes.Set(float64(sumBlockSizes(db.blocks)))
 		case <-db.stopc:
 			return
 		}
 	}
 }
 
-func (db *DB) retentionCutoff() (b bool, err error) {
-	defer func() {
-		if !b && err == nil {
-			// no data had to be cut off.
-			return
-		}
-		db.metrics.cutoffs.Inc()
-		if err != nil {
-			db.metrics.cutoffsFailed.Inc()
-		}
-	}()
+func (db *DB) beyondRetention(meta *BlockMeta) bool {
 	if db.opts.RetentionDuration == 0 {
-		return false, nil
+		return false
 	}
 
 	db.mtx.RLock()
@@ -328,46 +306,13 @@ func (db *DB) retentionCutoff() (b bool, err error) {
 	db.mtx.RUnlock()
 
 	if len(blocks) == 0 {
-		return false, nil
+		return false
 	}
 
-	// Size based retention, if MaxBytes is less than or equal to 0,
-	// only time based retention will be used.
-	var dirsBySize []string
-	if db.opts.MaxBytes > 0 {
-		dirsBySize, err = db.maxByteCutoffDirs()
-		if err != nil {
-			return false, err
-		}
-	}
-
-	if len(dirsBySize) > 0 {
-		msg := fmt.Sprintf("data limit was exceeded and %d records will be deleted", len(dirsBySize))
-		level.Warn(db.logger).Log("msg", msg)
-	}
-
-	// Time based retention
 	last := blocks[len(db.blocks)-1]
-
 	mint := last.Meta().MaxTime - int64(db.opts.RetentionDuration)
-	dirsByTime, err := retentionCutoffDirs(db.dir, mint)
-	if err != nil {
-		return false, err
-	}
 
-	// Remove blocks that fall under either retention criteria
-	dirs := append(dirsBySize, dirsByTime...)
-
-	// This will close the dirs and then delete the dirs.
-	if len(dirs) > 0 {
-		return true, db.reload(dirs...)
-	}
-
-	if len(dirsBySize) > 0 {
-		db.metrics.dataLimitDeletions.Inc()
-	}
-
-	return false, nil
+	return meta.MaxTime < mint
 }
 
 // Appender opens a new appender against the database.
@@ -396,6 +341,13 @@ func (a dbAppender) Commit() error {
 	return err
 }
 
+// Compact data if possible. After successful compaction blocks are reloaded
+// which will also trigger blocks to be deleted that fall out of the retention
+// window.
+// If no blocks are compacted, the retention window state doesn't change. Thus,
+// this is sufficient to reliably delete old data.
+// Old blocks are only deleted on reload based on the new block's parent information.
+// See DB.reload documentation for further information.
 func (db *DB) compact() (changes bool, err error) {
 	db.cmtx.Lock()
 	defer db.cmtx.Unlock()
@@ -425,7 +377,7 @@ func (db *DB) compact() (changes bool, err error) {
 			mint: mint,
 			maxt: maxt,
 		}
-		if _, err = db.compactor.Write(db.dir, head, mint, maxt); err != nil {
+		if _, err = db.compactor.Write(db.dir, head, mint, maxt, nil); err != nil {
 			return changes, errors.Wrap(err, "persist head block")
 		}
 		changes = true
@@ -460,92 +412,13 @@ func (db *DB) compact() (changes bool, err error) {
 		changes = true
 		runtime.GC()
 
-		if err := db.reload(plan...); err != nil {
+		if err := db.reload(); err != nil {
 			return changes, errors.Wrap(err, "reload blocks")
 		}
 		runtime.GC()
 	}
 
 	return changes, nil
-}
-
-// retentionCutoffDirs returns all directories of blocks in dir that are strictly
-// before mint.
-func retentionCutoffDirs(dir string, mint int64) ([]string, error) {
-	df, err := fileutil.OpenDir(dir)
-	if err != nil {
-		return nil, errors.Wrapf(err, "open directory")
-	}
-	defer df.Close()
-
-	dirs, err := blockDirs(dir)
-	if err != nil {
-		return nil, errors.Wrapf(err, "list block dirs %s", dir)
-	}
-
-	delDirs := []string{}
-
-	for _, dir := range dirs {
-		meta, err := readMetaFile(dir)
-		if err != nil {
-			return nil, errors.Wrapf(err, "read block meta %s", dir)
-		}
-		// The first block we encounter marks that we crossed the boundary
-		// of deletable blocks.
-		if meta.MaxTime >= mint {
-			break
-		}
-
-		delDirs = append(delDirs, dir)
-	}
-
-	return delDirs, nil
-}
-
-// maxBytesCutoffDirs returns all the oldest directories that would need to be
-// deleted to maintain the 'MaxBytes' option.
-func (db *DB) maxByteCutoffDirs() ([]string, error) {
-	dataDirSize := sumBlockSizes(db.blocks)
-	if dataDirSize <= db.opts.MaxBytes {
-		return nil, nil
-	}
-
-	// Limit has been exceeded
-	delDirs := []string{}
-	sizeToDelete := int64(0)
-
-	dirs, err := blockDirs(db.dir)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to open block directories")
-	}
-	for _, dir := range dirs {
-		meta, err := readMetaFile(dir)
-		if err != nil {
-			return nil, errors.Wrap(err, "find blocks")
-		}
-
-		if block, exists := db.getBlock(meta.ULID); exists {
-			sizeToDelete += block.Size()
-		}
-
-		delDirs = append(delDirs, dir)
-		// Keep going until the size of the storage folder minus the size of the oldest
-		// blocks is still over the limit.
-		if dataDirSize-sizeToDelete < db.opts.MaxBytes {
-			break
-		}
-	}
-
-	return delDirs, nil
-
-}
-
-func sumBlockSizes(blocks []*Block) int64 {
-	var result int64
-	for _, block := range blocks {
-		result += block.Size()
-	}
-	return result
 }
 
 func (db *DB) getBlock(id ulid.ULID) (*Block, bool) {
@@ -557,18 +430,9 @@ func (db *DB) getBlock(id ulid.ULID) (*Block, bool) {
 	return nil, false
 }
 
-func stringsContain(set []string, elem string) bool {
-	for _, e := range set {
-		if elem == e {
-			return true
-		}
-	}
-	return false
-}
-
 // reload on-disk blocks and trigger head truncation if new blocks appeared. It takes
 // a list of block directories which should be deleted during reload.
-func (db *DB) reload(deleteable ...string) (err error) {
+func (db *DB) reload() (err error) {
 	defer func() {
 		if err != nil {
 			db.metrics.reloadsFailed.Inc()
@@ -580,21 +444,54 @@ func (db *DB) reload(deleteable ...string) (err error) {
 	if err != nil {
 		return errors.Wrap(err, "find blocks")
 	}
+	// We delete old blocks that have been superseded by new ones by gathering all parents
+	// from existing blocks. Those parents all have newer replacements and can be safely deleted
+	// after we loaded the other blocks.
+	// This makes us resilient against the process crashing towards the end of a compaction.
+	// Creation of a new block and deletion of its parents cannot happen atomically. By creating
+	// blocks with their parents, we can pick up the deletion where it left off during a crash.
 	var (
-		blocks []*Block
-		exist  = map[ulid.ULID]struct{}{}
+		blocks     []*Block
+		corrupted        = map[ulid.ULID]error{}
+		opened           = map[ulid.ULID]struct{}{}
+		deleteable       = map[ulid.ULID]struct{}{}
+		blocksSize int64 = 0
 	)
+	for _, dir := range dirs {
+		meta, err := readMetaFile(dir)
+		if err != nil {
+			// The block was potentially in the middle of being deleted during a crash.
+			// Skip it since we may delete it properly further down again.
+			level.Warn(db.logger).Log("msg", "read meta information", "err", err, "dir", dir)
 
+			ulid, err2 := ulid.Parse(filepath.Base(dir))
+			if err2 != nil {
+				level.Error(db.logger).Log("msg", "not a block dir", "dir", dir)
+				continue
+			}
+			corrupted[ulid] = err
+			continue
+		}
+		if db.beyondRetention(meta) {
+			deleteable[meta.ULID] = struct{}{}
+			continue
+		}
+		for _, b := range meta.Compaction.Parents {
+			deleteable[b.ULID] = struct{}{}
+		}
+	}
+	// Blocks we failed to open should all be those we are want to delete anyway.
+	for c, err := range corrupted {
+		if _, ok := deleteable[c]; !ok {
+			return errors.Wrapf(err, "unexpected corrupted block %s", c)
+		}
+	}
+	// Get storage blocks total size
 	for _, dir := range dirs {
 		meta, err := readMetaFile(dir)
 		if err != nil {
 			return errors.Wrapf(err, "read meta information %s", dir)
 		}
-		// If the block is pending for deletion, don't add it to the new block set.
-		if stringsContain(deleteable, dir) {
-			continue
-		}
-
 		b, ok := db.getBlock(meta.ULID)
 		if !ok {
 			b, err = OpenBlock(dir, db.chunkPool)
@@ -602,9 +499,37 @@ func (db *DB) reload(deleteable ...string) (err error) {
 				return errors.Wrapf(err, "open block %s", dir)
 			}
 		}
+		blocksSize += b.Size()
+	}
+	// Load new blocks into memory.
+	for _, dir := range dirs {
+		meta, err := readMetaFile(dir)
+		if err != nil {
+			return errors.Wrapf(err, "read meta information %s", dir)
+		}
+		// Don't load blocks that are scheduled for deletion.
+		if _, ok := deleteable[meta.ULID]; ok {
+			continue
+		}
+		// See if we already have the block in memory or open it otherwise.
+		b, ok := db.getBlock(meta.ULID)
+		if !ok {
+			b, err = OpenBlock(dir, db.chunkPool)
+			if err != nil {
+				return errors.Wrapf(err, "open block %s", dir)
+			}
+		}
+		// If the blocks still take up more than the max bytes, don't load this block
+		// and add it to the list of blocks to be deleted
+		if db.opts.MaxBytes > 0 && blocksSize > db.opts.MaxBytes {
+			blocksSize -= b.Size()
+			deleteable[meta.ULID] = struct{}{}
+			db.metrics.dataLimitDeletions.Inc()
+			continue
+		}
 
 		blocks = append(blocks, b)
-		exist[meta.ULID] = struct{}{}
+		opened[meta.ULID] = struct{}{}
 	}
 	sort.Slice(blocks, func(i, j int) bool {
 		return blocks[i].Meta().MinTime < blocks[j].Meta().MinTime
@@ -621,17 +546,22 @@ func (db *DB) reload(deleteable ...string) (err error) {
 	db.blocks = blocks
 	db.mtx.Unlock()
 
+	// Drop old blocks from memory.
 	for _, b := range oldBlocks {
-		if _, ok := exist[b.Meta().ULID]; ok {
+		if _, ok := opened[b.Meta().ULID]; ok {
 			continue
 		}
 		if err := b.Close(); err != nil {
 			level.Warn(db.logger).Log("msg", "closing block failed", "err", err)
 		}
-		if err := os.RemoveAll(b.Dir()); err != nil {
-			level.Warn(db.logger).Log("msg", "deleting block failed", "err", err)
+	}
+	// Delete all obsolete blocks. None of them are opened any longer.
+	for ulid := range deleteable {
+		if err := os.RemoveAll(filepath.Join(db.dir, ulid.String())); err != nil {
+			return errors.Wrapf(err, "delete obsolete block %s", ulid)
 		}
 	}
+	db.metrics.storageBytes.Set(float64(blocksSize))
 
 	// Garbage collect data in the head if the most recent persisted block
 	// covers data of its current time range.
@@ -853,7 +783,7 @@ func (db *DB) Snapshot(dir string, withHead bool) error {
 	if !withHead {
 		return nil
 	}
-	_, err := db.compactor.Write(dir, db.head, db.head.MinTime(), db.head.MaxTime())
+	_, err := db.compactor.Write(dir, db.head, db.head.MinTime(), db.head.MaxTime(), nil)
 	return errors.Wrap(err, "snapshot head block")
 }
 
@@ -947,22 +877,15 @@ func (db *DB) CleanTombstones() (err error) {
 	blocks := db.blocks[:]
 	db.mtx.RUnlock()
 
-	deletable := []string{}
 	for _, b := range blocks {
 		if uid, er := b.CleanTombstones(db.Dir(), db.compactor); er != nil {
 			err = errors.Wrapf(er, "clean tombstones: %s", b.Dir())
 			return err
 		} else if uid != nil { // New block was created.
-			deletable = append(deletable, b.Dir())
 			newUIDs = append(newUIDs, *uid)
 		}
 	}
-
-	if len(deletable) == 0 {
-		return nil
-	}
-
-	return errors.Wrap(db.reload(deletable...), "reload blocks")
+	return errors.Wrap(db.reload(), "reload blocks")
 }
 
 func intervalOverlap(amin, amax, bmin, bmax int64) bool {
