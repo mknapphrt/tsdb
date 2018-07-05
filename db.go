@@ -59,7 +59,7 @@ type Options struct {
 	// Duration of persisted data to keep.
 	RetentionDuration uint64
 
-	// Maximum number of bytes to be retained.
+	// Maximum number of bytes in blocks to be retained.
 	MaxBytes int64
 
 	// The sizes of the Blocks.
@@ -109,8 +109,6 @@ type DB struct {
 	// Mutex for that must be held when modifying the general block layout.
 	mtx    sync.RWMutex
 	blocks []*Block
-	//	blockSizeCache map[ulid.ULID]int64
-	blockSizeTotal int64
 
 	head *Head
 
@@ -171,7 +169,7 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 		Help: "The time taken to recompact blocks to remove tombstones.",
 	})
 	m.storageBytes = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "prometheus_tsdb_storage_bytes",
+		Name: "prometheus_tsdb_storage_blocks_bytes",
 		Help: "The number of bytes that are currently used for local storage.",
 	})
 	m.dataLimitDeletions = prometheus.NewCounter(prometheus.CounterOpts{
@@ -297,8 +295,6 @@ func (db *DB) run() {
 			} else {
 				backoff = 0
 			}
-
-			db.metrics.storageBytes.Set(float64(sumBlockSizes(db.blocks)))
 		case <-db.stopc:
 			return
 		}
@@ -318,22 +314,6 @@ func (db *DB) beyondRetention(meta *BlockMeta) bool {
 		return false
 	}
 
-	// Size based retention, if MaxBytes is less than or equal to 0,
-	// only time based retention will be used.
-	var dirsBySize []string
-	if db.opts.MaxBytes > 0 {
-		dirsBySize, err = db.maxByteCutoffDirs()
-		if err != nil {
-			return false, err
-		}
-	}
-
-	if len(dirsBySize) > 0 {
-		msg := fmt.Sprintf("data limit was exceeded and %d records will be deleted", len(dirsBySize))
-		level.Warn(db.logger).Log("msg", msg)
-	}
-
-	// Time based retention
 	last := blocks[len(db.blocks)-1]
 	mint := last.Meta().MaxTime - int64(db.opts.RetentionDuration)
 
@@ -484,9 +464,10 @@ func (db *DB) reload() (err error) {
 	// blocks with their parents, we can pick up the deletion where it left off during a crash.
 	var (
 		blocks     []*Block
-		corrupted  = map[ulid.ULID]error{}
-		opened     = map[ulid.ULID]struct{}{}
-		deleteable = map[ulid.ULID]struct{}{}
+		corrupted        = map[ulid.ULID]error{}
+		opened           = map[ulid.ULID]struct{}{}
+		deleteable       = map[ulid.ULID]struct{}{}
+		blocksSize int64 = 0
 	)
 	for _, dir := range dirs {
 		meta, err := readMetaFile(dir)
@@ -567,6 +548,7 @@ func (db *DB) reload() (err error) {
 			return errors.Wrapf(err, "delete obsolete block %s", ulid)
 		}
 	}
+	db.metrics.storageBytes.Set(float64(blocksSize))
 
 	// Garbage collect data in the head if the most recent persisted block
 	// covers data of its current time range.
