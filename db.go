@@ -108,6 +108,8 @@ type DB struct {
 	// Mutex for that must be held when modifying the general block layout.
 	mtx    sync.RWMutex
 	blocks []*Block
+	//	blockSizeCache map[ulid.ULID]int64
+	blockSizeTotal int64
 
 	head *Head
 
@@ -375,13 +377,7 @@ func (db *DB) compact() (changes bool, err error) {
 		head := &rangeHead{
 			head: db.head,
 			mint: mint,
-			// We remove 1 millisecond from maxt because block
-			// intervals are half-open: [b.MinTime, b.MaxTime). But
-			// chunk intervals are closed: [c.MinTime, c.MaxTime];
-			// so in order to make sure that overlaps are evaluated
-			// consistently, we explicitly remove the last value
-			// from the block interval here.
-			maxt: maxt - 1,
+			maxt: maxt,
 		}
 		if _, err = db.compactor.Write(db.dir, head, mint, maxt, nil); err != nil {
 			return changes, errors.Wrap(err, "persist head block")
@@ -438,7 +434,6 @@ func (db *DB) getBlock(id ulid.ULID) (*Block, bool) {
 
 // reload on-disk blocks and trigger head truncation if new blocks appeared. It takes
 // a list of block directories which should be deleted during reload.
-// Blocks that are obsolete due to replacement or retention will be deleted.
 func (db *DB) reload() (err error) {
 	defer func() {
 		if err != nil {
@@ -493,6 +488,7 @@ func (db *DB) reload() (err error) {
 			return errors.Wrapf(err, "unexpected corrupted block %s", c)
 		}
 	}
+	allBlocks := make([]*Block, 0)
 	// Get storage blocks total size
 	for _, dir := range dirs {
 		meta, err := readMetaFile(dir)
@@ -506,7 +502,21 @@ func (db *DB) reload() (err error) {
 				return errors.Wrapf(err, "open block %s", dir)
 			}
 		}
+		allBlocks = append(allBlocks, b)
 		blocksSize += b.Size()
+	}
+	// Sort the blocks to make sure the oldest is removed first
+	sort.Slice(allBlocks, func(i, j int) bool {
+		return allBlocks[i].Meta().MinTime < allBlocks[j].Meta().MinTime
+	})
+	// Select blocks for deletion
+	for _, block := range allBlocks {
+		if db.opts.MaxBytes > 0 && blocksSize > db.opts.MaxBytes {
+			fmt.Println(block.String())
+			blocksSize -= block.Size()
+			deleteable[block.Meta().ULID] = struct{}{}
+			db.metrics.dataLimitDeletions.Inc()
+		}
 	}
 	// Load new blocks into memory.
 	for _, dir := range dirs {
@@ -525,14 +535,6 @@ func (db *DB) reload() (err error) {
 			if err != nil {
 				return errors.Wrapf(err, "open block %s", dir)
 			}
-		}
-		// If the blocks still take up more than the max bytes, don't load this block
-		// and add it to the list of blocks to be deleted
-		if db.opts.MaxBytes > 0 && blocksSize > db.opts.MaxBytes {
-			blocksSize -= b.Size()
-			deleteable[meta.ULID] = struct{}{}
-			db.metrics.dataLimitDeletions.Inc()
-			continue
 		}
 		blocks = append(blocks, b)
 		opened[meta.ULID] = struct{}{}
@@ -802,7 +804,8 @@ func (db *DB) Querier(mint, maxt int64) (Querier, error) {
 	defer db.mtx.RUnlock()
 
 	for _, b := range db.blocks {
-		if b.OverlapsClosedInterval(mint, maxt) {
+		m := b.Meta()
+		if intervalOverlap(mint, maxt, m.MinTime, m.MaxTime) {
 			blocks = append(blocks, b)
 		}
 	}
@@ -844,7 +847,8 @@ func (db *DB) Delete(mint, maxt int64, ms ...labels.Matcher) error {
 	defer db.mtx.RUnlock()
 
 	for _, b := range db.blocks {
-		if b.OverlapsClosedInterval(mint, maxt) {
+		m := b.Meta()
+		if intervalOverlap(mint, maxt, m.MinTime, m.MaxTime) {
 			g.Go(func(b *Block) func() error {
 				return func() error { return b.Delete(mint, maxt, ms...) }
 			}(b))
@@ -890,6 +894,11 @@ func (db *DB) CleanTombstones() (err error) {
 		}
 	}
 	return errors.Wrap(db.reload(), "reload blocks")
+}
+
+func intervalOverlap(amin, amax, bmin, bmax int64) bool {
+	// Checks Overlap: http://stackoverflow.com/questions/3269434/
+	return amin <= bmax && bmin <= amax
 }
 
 func isBlockDir(fi os.FileInfo) bool {

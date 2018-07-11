@@ -285,6 +285,8 @@ func OpenBlock(dir string, pool chunkenc.Pool) (*Block, error) {
 	}
 	sz += cr.Size()
 	meta.Stats.NumBytes = sz
+	// Rewrite meta file with the size
+	writeMetaFile(dir, meta)
 
 	tr, err := readTombstones(dir)
 	if err != nil {
@@ -466,7 +468,7 @@ Outer:
 		}
 
 		for _, chk := range chks {
-			if chk.OverlapsClosedInterval(mint, maxt) {
+			if intervalOverlap(mint, maxt, chk.MinTime, chk.MaxTime) {
 				// Delete only until the current values and not beyond.
 				tmin, tmax := clampInterval(mint, maxt, chks[0].MinTime, chks[len(chks)-1].MaxTime)
 				stones[p.At()] = Intervals{{tmin, tmax}}
@@ -556,13 +558,6 @@ func (pb *Block) Snapshot(dir string) error {
 	}
 
 	return nil
-}
-
-// Returns true if the block overlaps [mint, maxt].
-func (pb *Block) OverlapsClosedInterval(mint, maxt int64) bool {
-	// The block itself is a half-open interval
-	// [pb.meta.MinTime, pb.meta.MaxTime).
-	return pb.meta.MinTime <= maxt && mint < pb.meta.MaxTime
 }
 
 func clampInterval(a, b, mint, maxt int64) (int64, int64) {
