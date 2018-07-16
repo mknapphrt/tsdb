@@ -170,8 +170,8 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 		Help: "The time taken to recompact blocks to remove tombstones.",
 	})
 	m.storageBytes = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "prometheus_tsdb_storage_blocks_bytes",
-		Help: "The number of bytes that are currently used for local storage.",
+		Name: "prometheus_tsdb_storage_blocks_bytes_total",
+		Help: "The number of bytes that are currently used for local storage by blocks.",
 	})
 	m.dataLimitDeletions = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "prometheus_tsdb_size_limit_deletions_total",
