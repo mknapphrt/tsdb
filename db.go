@@ -511,7 +511,7 @@ func (db *DB) reload() (err error) {
 				return errors.Wrapf(err, "open block %s", dir)
 			}
 		}
-		blocks = append(allBlocks, b)
+		blocks = append(blocks, b)
 		blocksSize += b.Size()
 	}
 	// Sort the blocks to make sure the oldest is removed first
