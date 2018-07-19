@@ -27,6 +27,8 @@ import (
 
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
+	"github.com/prometheus/tsdb/chunks"
+	"github.com/prometheus/tsdb/index"
 	"github.com/prometheus/tsdb/labels"
 	"github.com/prometheus/tsdb/testutil"
 	"github.com/prometheus/tsdb/wal"
