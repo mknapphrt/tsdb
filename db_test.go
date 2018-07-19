@@ -27,8 +27,6 @@ import (
 
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
-	"github.com/prometheus/tsdb/chunks"
-	"github.com/prometheus/tsdb/index"
 	"github.com/prometheus/tsdb/labels"
 	"github.com/prometheus/tsdb/testutil"
 	"github.com/prometheus/tsdb/wal"
@@ -79,9 +77,9 @@ func TestDB_reloadOrder(t *testing.T) {
 	defer db.Close()
 
 	metas := []*BlockMeta{
-		{ULID: ulid.MustNew(100, nil), MinTime: 90, MaxTime: 100},
-		{ULID: ulid.MustNew(200, nil), MinTime: 70, MaxTime: 80},
-		{ULID: ulid.MustNew(300, nil), MinTime: 100, MaxTime: 110},
+		{ULID: ulid.MustNew(100, nil), MinTime: 90, MaxTime: 100, Stats: BlockStats{NumBytes: 248}},
+		{ULID: ulid.MustNew(200, nil), MinTime: 70, MaxTime: 80, Stats: BlockStats{NumBytes: 247}},
+		{ULID: ulid.MustNew(300, nil), MinTime: 100, MaxTime: 110, Stats: BlockStats{NumBytes: 249}},
 	}
 	for _, m := range metas {
 		bdir := filepath.Join(db.Dir(), m.ULID.String())
