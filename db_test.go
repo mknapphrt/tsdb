@@ -26,8 +26,6 @@ import (
 
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
-	"github.com/prometheus/tsdb/chunks"
-	"github.com/prometheus/tsdb/index"
 	"github.com/prometheus/tsdb/labels"
 	"github.com/prometheus/tsdb/testutil"
 )
@@ -77,9 +75,9 @@ func TestDB_reloadOrder(t *testing.T) {
 	defer db.Close()
 
 	metas := []*BlockMeta{
-		{ULID: ulid.MustNew(100, nil), MinTime: 90, MaxTime: 100},
-		{ULID: ulid.MustNew(200, nil), MinTime: 70, MaxTime: 80},
-		{ULID: ulid.MustNew(300, nil), MinTime: 100, MaxTime: 110},
+		{ULID: ulid.MustNew(100, nil), MinTime: 90, MaxTime: 100, Stats: BlockStats{NumBytes: 248}},
+		{ULID: ulid.MustNew(200, nil), MinTime: 70, MaxTime: 80, Stats: BlockStats{NumBytes: 247}},
+		{ULID: ulid.MustNew(300, nil), MinTime: 100, MaxTime: 110, Stats: BlockStats{NumBytes: 249}},
 	}
 	for _, m := range metas {
 		bdir := filepath.Join(db.Dir(), m.ULID.String())
@@ -1097,91 +1095,4 @@ func TestOverlappingBlocksDetectsAllOverlaps(t *testing.T) {
 		{Min: 5, Max: 6}: {nc1[5], nc1[7]},                                 // 2-6, 5-7
 		{Min: 8, Max: 9}: {nc1[8], nc1[9]},                                 // 7-10, 8-9
 	}, OverlappingBlocks(nc1))
-}
-
-// Regression test for https://github.com/prometheus/tsdb/issues/347
-func TestChunkAtBlockBoundary(t *testing.T) {
-	db, close := openTestDB(t, nil)
-	defer close()
-	defer db.Close()
-
-	app := db.Appender()
-
-	blockRange := DefaultOptions.BlockRanges[0]
-	label := labels.FromStrings("foo", "bar")
-
-	for i := int64(0); i < 3; i++ {
-		_, err := app.Add(label, i*blockRange, 0)
-		testutil.Ok(t, err)
-		_, err = app.Add(label, i*blockRange+1000, 0)
-		testutil.Ok(t, err)
-	}
-
-	err := app.Commit()
-	testutil.Ok(t, err)
-
-	_, err = db.compact()
-	testutil.Ok(t, err)
-
-	for _, block := range db.blocks {
-		r, err := block.Index()
-		testutil.Ok(t, err)
-		defer r.Close()
-
-		meta := block.Meta()
-
-		p, err := r.Postings(index.AllPostingsKey())
-		testutil.Ok(t, err)
-
-		var (
-			lset labels.Labels
-			chks []chunks.Meta
-		)
-
-		chunkCount := 0
-
-		for p.Next() {
-			err = r.Series(p.At(), &lset, &chks)
-			testutil.Ok(t, err)
-			for _, c := range chks {
-				testutil.Assert(t, meta.MinTime <= c.MinTime && c.MaxTime <= meta.MaxTime,
-					"chunk spans beyond block boundaries: [block.MinTime=%d, block.MaxTime=%d]; [chunk.MinTime=%d, chunk.MaxTime=%d]",
-					meta.MinTime, meta.MaxTime, c.MinTime, c.MaxTime)
-				chunkCount++
-			}
-		}
-		testutil.Assert(t, chunkCount == 1, "expected 1 chunk in block %s, got %d", meta.ULID, chunkCount)
-	}
-}
-
-func TestQuerierWithBoundaryChunks(t *testing.T) {
-	db, close := openTestDB(t, nil)
-	defer close()
-	defer db.Close()
-
-	app := db.Appender()
-
-	blockRange := DefaultOptions.BlockRanges[0]
-	label := labels.FromStrings("foo", "bar")
-
-	for i := int64(0); i < 5; i++ {
-		_, err := app.Add(label, i*blockRange, 0)
-		testutil.Ok(t, err)
-	}
-
-	err := app.Commit()
-	testutil.Ok(t, err)
-
-	_, err = db.compact()
-	testutil.Ok(t, err)
-
-	testutil.Assert(t, len(db.blocks) >= 3, "invalid test, less than three blocks in DB")
-
-	q, err := db.Querier(blockRange, 2*blockRange)
-	testutil.Ok(t, err)
-	defer q.Close()
-
-	// The requested interval covers 2 blocks, so the querier should contain 2 blocks.
-	count := len(q.(*querier).blocks)
-	testutil.Assert(t, count == 2, "expected 2 blocks in querier, got %d", count)
 }
