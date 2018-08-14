@@ -162,6 +162,7 @@ type BlockStats struct {
 	NumSeries     uint64 `json:"numSeries,omitempty"`
 	NumChunks     uint64 `json:"numChunks,omitempty"`
 	NumTombstones uint64 `json:"numTombstones,omitempty"`
+	NumBytes      int64  `json:"numBytes,omitempty"`
 }
 
 // BlockDesc describes a block by ULID and time range.
@@ -270,6 +271,23 @@ func OpenBlock(dir string, pool chunkenc.Pool) (*Block, error) {
 		return nil, err
 	}
 
+	var sz int64
+	if fInfo, err := os.Stat(filepath.Join(dir, indexFilename)); err == nil {
+		sz += fInfo.Size()
+	}
+
+	if fInfo, err := os.Stat(filepath.Join(dir, metaFilename)); err == nil {
+		sz += fInfo.Size()
+	}
+
+	if fInfo, err := os.Stat(filepath.Join(dir, "tombstones")); err == nil {
+		sz += fInfo.Size()
+	}
+	sz += cr.Size()
+	meta.Stats.NumBytes = sz
+	// Rewrite meta file with the size
+	writeMetaFile(dir, meta)
+
 	tr, err := readTombstones(dir)
 	if err != nil {
 		return nil, err
@@ -311,6 +329,9 @@ func (pb *Block) Dir() string { return pb.dir }
 
 // Meta returns meta information about the block.
 func (pb *Block) Meta() BlockMeta { return pb.meta }
+
+// Size returns the number of bytes that the block takes up
+func (pb *Block) Size() int64 { return pb.meta.Stats.NumBytes }
 
 // ErrClosing is returned when a block is in the process of being closed.
 var ErrClosing = errors.New("block is closing")

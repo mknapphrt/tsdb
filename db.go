@@ -46,6 +46,7 @@ import (
 var DefaultOptions = &Options{
 	WALFlushInterval:  5 * time.Second,
 	RetentionDuration: 15 * 24 * 60 * 60 * 1000, // 15 days in milliseconds
+	MaxBytes:          0,                        // Don't use size based retention by default
 	BlockRanges:       ExponentialBlockRanges(int64(2*time.Hour)/1e6, 3, 5),
 	NoLockfile:        false,
 }
@@ -57,6 +58,9 @@ type Options struct {
 
 	// Duration of persisted data to keep.
 	RetentionDuration uint64
+
+	// Maximum number of bytes in blocks to be retained.
+	MaxBytes int64
 
 	// The sizes of the Blocks.
 	BlockRanges []int64
@@ -103,8 +107,9 @@ type DB struct {
 	compactor Compactor
 
 	// Mutex for that must be held when modifying the general block layout.
-	mtx    sync.RWMutex
-	blocks []*Block
+	mtx            sync.RWMutex
+	blocks         []*Block
+	blockSizeTotal int64
 
 	head *Head
 
@@ -125,6 +130,8 @@ type dbMetrics struct {
 	cutoffs              prometheus.Counter
 	cutoffsFailed        prometheus.Counter
 	tombCleanTimer       prometheus.Histogram
+	storageBytes         prometheus.Gauge
+	dataLimitDeletions   prometheus.Counter
 }
 
 func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
@@ -162,6 +169,14 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 		Name: "prometheus_tsdb_tombstone_cleanup_seconds",
 		Help: "The time taken to recompact blocks to remove tombstones.",
 	})
+	m.storageBytes = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "prometheus_tsdb_storage_blocks_bytes_total",
+		Help: "The number of bytes that are currently used for local storage by blocks.",
+	})
+	m.dataLimitDeletions = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_size_limit_deletions_total",
+		Help: "The number of times that blocks were deleted because the maximum number of bytes was exceeded.",
+	})
 
 	if r != nil {
 		r.MustRegister(
@@ -172,6 +187,8 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 			m.cutoffsFailed,
 			m.compactionsTriggered,
 			m.tombCleanTimer,
+			m.storageBytes,
+			m.dataLimitDeletions,
 		)
 	}
 	return m
@@ -279,7 +296,6 @@ func (db *DB) run() {
 			} else {
 				backoff = 0
 			}
-
 		case <-db.stopc:
 			return
 		}
@@ -428,7 +444,6 @@ func (db *DB) getBlock(id ulid.ULID) (*Block, bool) {
 
 // reload on-disk blocks and trigger head truncation if new blocks appeared. It takes
 // a list of block directories which should be deleted during reload.
-// Blocks that are obsolete due to replacement or retention will be deleted.
 func (db *DB) reload() (err error) {
 	defer func() {
 		if err != nil {
@@ -449,9 +464,10 @@ func (db *DB) reload() (err error) {
 	// blocks with their parents, we can pick up the deletion where it left off during a crash.
 	var (
 		blocks     []*Block
-		corrupted  = map[ulid.ULID]error{}
-		opened     = map[ulid.ULID]struct{}{}
-		deleteable = map[ulid.ULID]struct{}{}
+		corrupted        = map[ulid.ULID]error{}
+		opened           = map[ulid.ULID]struct{}{}
+		deleteable       = map[ulid.ULID]struct{}{}
+		blocksSize int64 = 0
 	)
 	for _, dir := range dirs {
 		meta, err := readMetaFile(dir)
@@ -482,17 +498,13 @@ func (db *DB) reload() (err error) {
 			return errors.Wrapf(err, "unexpected corrupted block %s", c)
 		}
 	}
-	// Load new blocks into memory.
+	// allBlocks := make([]*Block, 0)
+	// Get storage blocks total size
 	for _, dir := range dirs {
 		meta, err := readMetaFile(dir)
 		if err != nil {
 			return errors.Wrapf(err, "read meta information %s", dir)
 		}
-		// Don't load blocks that are scheduled for deletion.
-		if _, ok := deleteable[meta.ULID]; ok {
-			continue
-		}
-		// See if we already have the block in memory or open it otherwise.
 		b, ok := db.getBlock(meta.ULID)
 		if !ok {
 			b, err = OpenBlock(dir, db.chunkPool)
@@ -501,7 +513,33 @@ func (db *DB) reload() (err error) {
 			}
 		}
 		blocks = append(blocks, b)
-		opened[meta.ULID] = struct{}{}
+		blocksSize += b.Size()
+	}
+	// Sort the blocks to make sure the oldest is removed first
+	sort.Slice(blocks, func(i, j int) bool {
+		return blocks[i].Meta().MinTime < blocks[j].Meta().MinTime
+	})
+	// Select blocks for deletion
+	for _, block := range blocks {
+		if db.opts.MaxBytes > 0 && blocksSize > db.opts.MaxBytes {
+			blocksSize -= block.Size()
+			deleteable[block.Meta().ULID] = struct{}{}
+			for _, b := range block.Meta().Compaction.Parents {
+				deleteable[b.ULID] = struct{}{}
+			}
+			db.metrics.dataLimitDeletions.Inc()
+		}
+	}
+	tmpBlocks := blocks
+	blocks = nil
+	// Load new blocks into memory.
+	for _, block := range tmpBlocks {
+		// Don't load blocks that are scheduled for deletion.
+		if _, ok := deleteable[block.Meta().ULID]; ok {
+			continue
+		}
+		blocks = append(blocks, block)
+		opened[block.Meta().ULID] = struct{}{}
 	}
 	sort.Slice(blocks, func(i, j int) bool {
 		return blocks[i].Meta().MinTime < blocks[j].Meta().MinTime
@@ -532,6 +570,7 @@ func (db *DB) reload() (err error) {
 			return errors.Wrapf(err, "delete obsolete block %s", ulid)
 		}
 	}
+	db.metrics.storageBytes.Set(float64(blocksSize))
 
 	// Garbage collect data in the head if the most recent persisted block
 	// covers data of its current time range.
