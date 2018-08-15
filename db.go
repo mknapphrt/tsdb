@@ -35,6 +35,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/tsdb/errorutil"
 	"github.com/prometheus/tsdb/fileutil"
 	"github.com/prometheus/tsdb/labels"
 	"github.com/prometheus/tsdb/wal"
@@ -694,7 +695,7 @@ func (db *DB) Close() error {
 		g.Go(pb.Close)
 	}
 
-	var merr MultiError
+	var merr errorutil.MultiError
 
 	merr.Add(g.Wait())
 
@@ -906,57 +907,6 @@ func nextSequenceFile(dir string) (string, int, error) {
 		i = j
 	}
 	return filepath.Join(dir, fmt.Sprintf("%0.6d", i+1)), int(i + 1), nil
-}
-
-// The MultiError type implements the error interface, and contains the
-// Errors used to construct it.
-type MultiError []error
-
-// Returns a concatenated string of the contained errors
-func (es MultiError) Error() string {
-	var buf bytes.Buffer
-
-	if len(es) > 1 {
-		fmt.Fprintf(&buf, "%d errors: ", len(es))
-	}
-
-	for i, err := range es {
-		if i != 0 {
-			buf.WriteString("; ")
-		}
-		buf.WriteString(err.Error())
-	}
-
-	return buf.String()
-}
-
-// Add adds the error to the error list if it is not nil.
-func (es *MultiError) Add(err error) {
-	if err == nil {
-		return
-	}
-	if merr, ok := err.(MultiError); ok {
-		*es = append(*es, merr...)
-	} else {
-		*es = append(*es, err)
-	}
-}
-
-// Err returns the error list as an error or nil if it is empty.
-func (es MultiError) Err() error {
-	if len(es) == 0 {
-		return nil
-	}
-	return es
-}
-
-func closeAll(cs ...io.Closer) error {
-	var merr MultiError
-
-	for _, c := range cs {
-		merr.Add(c.Close())
-	}
-	return merr.Err()
 }
 
 func exponential(d, min, max time.Duration) time.Duration {

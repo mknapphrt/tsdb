@@ -29,6 +29,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/tsdb/chunks"
+	"github.com/prometheus/tsdb/errorutil"
 	"github.com/prometheus/tsdb/fileutil"
 	"github.com/prometheus/tsdb/index"
 	"github.com/prometheus/tsdb/labels"
@@ -360,7 +361,7 @@ func (c *LeveledCompactor) Compact(dest string, dirs ...string) (uid ulid.ULID, 
 		return uid, nil
 	}
 
-	var merr MultiError
+	var merr errorutil.MultiError
 	merr.Add(err)
 
 	for _, b := range bs {
@@ -523,7 +524,7 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 		allSymbols = make(map[string]struct{}, 1<<16)
 		closers    = []io.Closer{}
 	)
-	defer func() { closeAll(closers...) }()
+	defer func() { fileutil.CloseAll(closers...) }()
 
 	for i, b := range blocks {
 		indexr, err := b.Index()

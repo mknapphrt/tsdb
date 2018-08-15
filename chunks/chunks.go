@@ -342,7 +342,7 @@ func NewDirReader(dir string, pool chunkenc.Pool) (*Reader, error) {
 }
 
 func (s *Reader) Close() error {
-	return closeAll(s.cs...)
+	return fileutil.CloseAll(s.cs...)
 }
 
 func (s *Reader) Chunk(ref uint64) (chunkenc.Chunk, error) {
@@ -402,13 +402,4 @@ func sequenceFiles(dir string) ([]string, error) {
 		res = append(res, filepath.Join(dir, fi.Name()))
 	}
 	return res, nil
-}
-
-func closeAll(cs ...io.Closer) (err error) {
-	for _, c := range cs {
-		if e := c.Close(); e != nil {
-			err = e
-		}
-	}
-	return err
 }

@@ -26,6 +26,7 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
+	"github.com/prometheus/tsdb/errorutil"
 	"github.com/prometheus/tsdb/fileutil"
 	"github.com/prometheus/tsdb/wal"
 )
@@ -69,7 +70,7 @@ func LastCheckpoint(dir string) (string, int, error) {
 // DeleteCheckpoints deletes all checkpoints in dir that have an index
 // below n.
 func DeleteCheckpoints(dir string, n int) error {
-	var errs MultiError
+	var errs errorutil.MultiError
 
 	files, err := ioutil.ReadDir(dir)
 	if err != nil {

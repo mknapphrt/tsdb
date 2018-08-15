@@ -5,9 +5,12 @@
 package fileutil
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+
+	"github.com/prometheus/tsdb/errorutil"
 )
 
 // ReadDir returns the filenames in the given directory in sorted order.
@@ -65,4 +68,13 @@ func Replace(from, to string) error {
 		return err
 	}
 	return pdir.Close()
+}
+
+func CloseAll(cs ...io.Closer) error {
+	var merr errorutil.MultiError
+
+	for _, c := range cs {
+		merr.Add(c.Close())
+	}
+	return merr.Err()
 }
