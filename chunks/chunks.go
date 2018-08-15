@@ -345,6 +345,14 @@ func (s *Reader) Close() error {
 	return fileutil.CloseAll(s.cs...)
 }
 
+func (s *Reader) Size() int64 {
+	var size int
+	for _, f := range s.bs {
+		size += f.Len()
+	}
+	return int64(size)
+}
+
 func (s *Reader) Chunk(ref uint64) (chunkenc.Chunk, error) {
 	var (
 		seq = int(ref >> 32)
