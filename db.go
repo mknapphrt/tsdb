@@ -46,7 +46,6 @@ import (
 var DefaultOptions = &Options{
 	WALFlushInterval:  5 * time.Second,
 	RetentionDuration: 15 * 24 * 60 * 60 * 1000, // 15 days in milliseconds
-	MaxBytes:          0,                        // Don't use size based retention by default
 	BlockRanges:       ExponentialBlockRanges(int64(2*time.Hour)/1e6, 3, 5),
 	NoLockfile:        false,
 }
@@ -107,9 +106,8 @@ type DB struct {
 	compactor Compactor
 
 	// Mutex for that must be held when modifying the general block layout.
-	mtx            sync.RWMutex
-	blocks         []*Block
-	blockSizeTotal int64
+	mtx    sync.RWMutex
+	blocks []*Block
 
 	head *Head
 
@@ -498,12 +496,17 @@ func (db *DB) reload() (err error) {
 			return errors.Wrapf(err, "unexpected corrupted block %s", c)
 		}
 	}
-	// Get storage blocks total size
+	// Get storage blocks total size.
 	for _, dir := range dirs {
 		meta, err := readMetaFile(dir)
 		if err != nil {
 			return errors.Wrapf(err, "read meta information %s", dir)
 		}
+		// Don't load blocks that are scheduled for deletion.
+		if _, ok := deleteable[meta.ULID]; ok {
+			continue
+		}
+		// See if we already have the block in memory or open it otherwise.
 		b, ok := db.getBlock(meta.ULID)
 		if !ok {
 			b, err = OpenBlock(dir, db.chunkPool)
@@ -514,11 +517,11 @@ func (db *DB) reload() (err error) {
 		blocks = append(blocks, b)
 		blocksSize += b.Size()
 	}
-	// Sort the blocks to make sure the oldest is removed first
+	// Sort the blocks to make sure the oldest is removed first.
 	sort.Slice(blocks, func(i, j int) bool {
 		return blocks[i].Meta().MinTime < blocks[j].Meta().MinTime
 	})
-	// Select blocks for deletion
+	// Select blocks for deletion.
 	for _, block := range blocks {
 		if db.opts.MaxBytes > 0 && blocksSize > db.opts.MaxBytes {
 			blocksSize -= block.Size()

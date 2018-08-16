@@ -285,7 +285,7 @@ func OpenBlock(dir string, pool chunkenc.Pool) (*Block, error) {
 	}
 	sz += cr.Size()
 	meta.Stats.NumBytes = sz
-	// Rewrite meta file with the size
+	// Rewrite meta file with the size.
 	writeMetaFile(dir, meta)
 
 	tr, err := readTombstones(dir)
