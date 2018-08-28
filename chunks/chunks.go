@@ -291,13 +291,10 @@ type Reader struct {
 	cs []io.Closer
 
 	pool chunkenc.Pool
-
-	// The size of the chunks
-	size int64
 }
 
-func newReader(bs []ByteSlice, cs []io.Closer, pool chunkenc.Pool, size int64) (*Reader, error) {
-	cr := Reader{pool: pool, bs: bs, cs: cs, size: size}
+func newReader(bs []ByteSlice, cs []io.Closer, pool chunkenc.Pool) (*Reader, error) {
+	cr := Reader{pool: pool, bs: bs, cs: cs}
 
 	for i, b := range cr.bs {
 		if b.Len() < 4 {
@@ -312,11 +309,11 @@ func newReader(bs []ByteSlice, cs []io.Closer, pool chunkenc.Pool, size int64) (
 }
 
 // NewReader returns a new chunk reader against the given byte slices.
-func NewReader(bs []ByteSlice, pool chunkenc.Pool, size int64) (*Reader, error) {
+func NewReader(bs []ByteSlice, pool chunkenc.Pool) (*Reader, error) {
 	if pool == nil {
 		pool = chunkenc.NewPool()
 	}
-	return newReader(bs, nil, pool, size)
+	return newReader(bs, nil, pool)
 }
 
 // NewDirReader returns a new Reader against sequentially numbered files in the
@@ -332,14 +329,8 @@ func NewDirReader(dir string, pool chunkenc.Pool) (*Reader, error) {
 
 	var bs []ByteSlice
 	var cs []io.Closer
-	var sz int64 = 0
 
 	for _, fn := range files {
-		fInfo, err := os.Stat(fn)
-		if err != nil {
-			return nil, errors.Wrapf(err, "stat file")
-		}
-		sz += fInfo.Size()
 		f, err := fileutil.OpenMmapFile(fn)
 		if err != nil {
 			return nil, errors.Wrapf(err, "mmap files")
@@ -347,14 +338,20 @@ func NewDirReader(dir string, pool chunkenc.Pool) (*Reader, error) {
 		cs = append(cs, f)
 		bs = append(bs, realByteSlice(f.Bytes()))
 	}
-	return newReader(bs, cs, pool, sz)
+	return newReader(bs, cs, pool)
 }
 
 func (s *Reader) Close() error {
 	return closeAll(s.cs...)
 }
 
-func (s *Reader) Size() int64 { return s.size }
+func (s *Reader) Size() int64 {
+	var size int
+	for _, f := range s.bs {
+		size += f.Len()
+	}
+	return int64(size)
+}
 
 func (s *Reader) Chunk(ref uint64) (chunkenc.Chunk, error) {
 	var (

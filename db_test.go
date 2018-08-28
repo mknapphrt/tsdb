@@ -935,48 +935,48 @@ func TestDB_Retention(t *testing.T) {
 	testutil.Equals(t, int64(100), db.blocks[0].meta.MaxTime) // To verify its the right block.
 }
 
-func TestSizeBasedretention(t *testing.t) {
-	db, close := opentestdb(t, &options{
-		blockranges: []int64{100},
-		maxbytes:    1000,
+func TestSizeBasedretention(t *testing.T) {
+	db, close := openTestDB(t, &Options{
+		BlockRanges: []int64{100},
+		MaxBytes:    1000,
 	})
 	defer close()
 
 	// Add some empty blocks, each empty block is 249 bytes.
-	blocks := []*blockmeta{
-		{ulid: ulid.mustnew(100, nil), mintime: 100, maxtime: 200},
-		{ulid: ulid.mustnew(200, nil), mintime: 200, maxtime: 300},
-		{ulid: ulid.mustnew(300, nil), mintime: 300, maxtime: 400},
-		{ulid: ulid.mustnew(400, nil), mintime: 400, maxtime: 500},
-		{ulid: ulid.mustnew(500, nil), mintime: 500, maxtime: 600},
+	blocks := []*BlockMeta{
+		{ULID: ulid.MustNew(100, nil), MinTime: 100, MaxTime: 200},
+		{ULID: ulid.MustNew(200, nil), MinTime: 200, MaxTime: 300},
+		{ULID: ulid.MustNew(300, nil), MinTime: 300, MaxTime: 400},
+		{ULID: ulid.MustNew(400, nil), MinTime: 400, MaxTime: 500},
+		{ULID: ulid.MustNew(500, nil), MinTime: 500, MaxTime: 600},
 	}
 	for _, m := range blocks {
-		createemptyblock(t, filepath.join(db.dir(), m.ulid.string()), m)
+		createEmptyBlock(t, filepath.Join(db.Dir(), m.ULID.String()), m)
 	}
 
 	// Reload and ensure that actual size is less than limit.
-	testutil.ok(t, db.reload())
+	testutil.Ok(t, db.reload())
 
 	var size int64
 	for _, b := range db.blocks {
-		size += b.size()
+		size += b.Size()
 	}
-	testutil.assert(t, size < db.opts.maxbytes, "actual size (%v) is expected to be less than limit (%v)", size, db.opts.maxbytes)
-	testutil.equals(t, 4, len(db.blocks))
-	testutil.equals(t, int64(300), db.blocks[0].meta.maxtime) // Ensure oldest block was deleted.
+	testutil.Assert(t, size < db.opts.MaxBytes, "actual size (%v) is expected to be less than limit (%v)", size, db.opts.MaxBytes)
+	testutil.Equals(t, 4, len(db.blocks))
+	testutil.Equals(t, int64(300), db.blocks[0].meta.MaxTime) // Ensure oldest block was deleted.
 
 	// Reduce the size limit and test again.
-	db.opts.maxbytes = 400
-	testutil.ok(t, db.reload())
+	db.opts.MaxBytes = 400
+	testutil.Ok(t, db.reload())
 
 	size = 0
 	for _, b := range db.blocks {
-		size += b.size()
+		size += b.Size()
 	}
 
-	testutil.assert(t, size < db.opts.maxbytes, "actual size (%v) is expected to be less than limit (%v)", size, db.opts.maxbytes)
-	testutil.equals(t, 1, len(db.blocks))
-	testutil.equals(t, int64(600), db.blocks[0].meta.maxtime) // Ensure oldest blocks were deleted.
+	testutil.Assert(t, size < db.opts.MaxBytes, "actual size (%v) is expected to be less than limit (%v)", size, db.opts.MaxBytes)
+	testutil.Equals(t, 1, len(db.blocks))
+	testutil.Equals(t, int64(600), db.blocks[0].meta.MaxTime) // Ensure oldest blocks were deleted.
 }
 
 func TestNotMatcherSelectsLabelsUnsetSeries(t *testing.T) {
