@@ -935,14 +935,13 @@ func TestDB_Retention(t *testing.T) {
 	testutil.Equals(t, int64(100), db.blocks[0].meta.MaxTime) // To verify its the right block.
 }
 
-func TestSizeBasedretention(t *testing.T) {
+func TestSizeBasedRetention(t *testing.T) {
 	db, close := openTestDB(t, &Options{
 		BlockRanges: []int64{100},
-		MaxBytes:    1000,
 	})
 	defer close()
 
-	// Add some empty blocks, each empty block is 249 bytes.
+	// Add some empty blocks.
 	blocks := []*BlockMeta{
 		{ULID: ulid.MustNew(100, nil), MinTime: 100, MaxTime: 200},
 		{ULID: ulid.MustNew(200, nil), MinTime: 200, MaxTime: 300},
@@ -954,6 +953,12 @@ func TestSizeBasedretention(t *testing.T) {
 		createEmptyBlock(t, filepath.Join(db.Dir(), m.ULID.String()), m)
 	}
 
+	// Figure out how large an empty block is.
+	emptyBlockDir := filepath.Join(db.Dir(), blocks[0].ULID.String())
+	emptyBlock, err := OpenBlock(emptyBlockDir, db.chunkPool)
+	testutil.Ok(t, err)
+	db.opts.MaxBytes = 4 * emptyBlock.Size()
+
 	// Reload and ensure that actual size is less than limit.
 	testutil.Ok(t, db.reload())
 
@@ -961,12 +966,12 @@ func TestSizeBasedretention(t *testing.T) {
 	for _, b := range db.blocks {
 		size += b.Size()
 	}
-	testutil.Assert(t, size < db.opts.MaxBytes, "actual size (%v) is expected to be less than limit (%v)", size, db.opts.MaxBytes)
+	testutil.Assert(t, size <= db.opts.MaxBytes, "actual size (%v) is expected to be less than or equal to limit (%v)", size, db.opts.MaxBytes)
 	testutil.Equals(t, 4, len(db.blocks))
 	testutil.Equals(t, int64(300), db.blocks[0].meta.MaxTime) // Ensure oldest block was deleted.
 
 	// Reduce the size limit and test again.
-	db.opts.MaxBytes = 400
+	db.opts.MaxBytes = 1 * emptyBlock.Size()
 	testutil.Ok(t, db.reload())
 
 	size = 0
@@ -974,7 +979,7 @@ func TestSizeBasedretention(t *testing.T) {
 		size += b.Size()
 	}
 
-	testutil.Assert(t, size < db.opts.MaxBytes, "actual size (%v) is expected to be less than limit (%v)", size, db.opts.MaxBytes)
+	testutil.Assert(t, size <= db.opts.MaxBytes, "actual size (%v) is expected to be less than or equal to limit (%v)", size, db.opts.MaxBytes)
 	testutil.Equals(t, 1, len(db.blocks))
 	testutil.Equals(t, int64(600), db.blocks[0].meta.MaxTime) // Ensure oldest blocks were deleted.
 }

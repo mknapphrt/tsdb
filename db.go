@@ -450,23 +450,56 @@ func (db *DB) reload() (err error) {
 		db.metrics.reloads.Inc()
 	}()
 
-	dirs, err := blockDirs(db.dir)
-	if err != nil {
-		return errors.Wrap(err, "find blocks")
-	}
+	//dirs, err := blockDirs(db.dir)
+	//if err != nil {
+	//	return errors.Wrap(err, "find blocks")
+	//}
 	// We delete old blocks that have been superseded by new ones by gathering all parents
 	// from existing blocks. Those parents all have newer replacements and can be safely deleted
 	// after we loaded the other blocks.
 	// This makes us resilient against the process crashing towards the end of a compaction.
 	// Creation of a new block and deletion of its parents cannot happen atomically. By creating
 	// blocks with their parents, we can pick up the deletion where it left off during a crash.
-	var (
-		blocks     []*Block
-		corrupted        = map[ulid.ULID]error{}
-		opened           = map[ulid.ULID]struct{}{}
-		deleteable       = map[ulid.ULID]struct{}{}
-		blocksSize int64 = 0
-	)
+	goodBlocks, corruptedBlocks, err := db.loadAll()
+	if err != nil {
+		return err
+	}
+	filteredBlocks, deleteableBlocks, err := db.filterDeleteable(goodBlocks, corruptedBlocks)
+	if err != nil {
+		return err
+	}
+
+	sort.Slice(filteredBlocks, func(i, j int) bool {
+		return filteredBlocks[i].Meta().MinTime < filteredBlocks[j].Meta().MinTime
+	})
+	if err := validateBlockSequence(filteredBlocks); err != nil {
+		return errors.Wrap(err, "invalid block sequence")
+	}
+
+	if err := db.removeDeleteable(filteredBlocks, deleteableBlocks); err != nil {
+		return err
+	}
+	blocksSize := int64(0)
+	for _, b := range filteredBlocks {
+		blocksSize += b.Size()
+	}
+	db.metrics.storageBytes.Set(float64(blocksSize))
+
+	if len(filteredBlocks) == 0 {
+		return nil
+	}
+	maxt := filteredBlocks[len(filteredBlocks)-1].Meta().MaxTime
+
+	return errors.Wrap(db.head.Truncate(maxt), "head truncate failed")
+}
+
+func (db *DB) loadAll() (goodBlocks map[ulid.ULID]*Block, corruptedBlocks map[ulid.ULID]error, err error) {
+	dirs, err := blockDirs(db.dir)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "find blocks")
+	}
+	goodBlocks = make(map[ulid.ULID]*Block)
+
 	for _, dir := range dirs {
 		meta, err := readMetaFile(dir)
 		if err != nil {
@@ -479,43 +512,46 @@ func (db *DB) reload() (err error) {
 				level.Error(db.logger).Log("msg", "not a block dir", "dir", dir)
 				continue
 			}
-			corrupted[ulid] = err
+			corruptedBlocks[ulid] = err
 			continue
 		}
-		if db.beyondRetention(meta) {
-			deleteable[meta.ULID] = struct{}{}
-			continue
+		b, err := OpenBlock(dir, db.chunkPool)
+		if err != nil {
+			return nil, nil, err
 		}
-		for _, b := range meta.Compaction.Parents {
+		goodBlocks[meta.ULID] = b
+	}
+	return goodBlocks, corruptedBlocks, nil
+}
+
+func (db *DB) filterDeleteable(goodBlocks map[ulid.ULID]*Block, corrupted map[ulid.ULID]error) (filteredBlocks []*Block, deleteable map[ulid.ULID]struct{}, err error) {
+	deleteable = make(map[ulid.ULID]struct{})
+	for _, block := range goodBlocks {
+		if db.beyondRetention(&block.meta) {
+			deleteable[block.meta.ULID] = struct{}{}
+		}
+		for _, b := range block.meta.Compaction.Parents {
 			deleteable[b.ULID] = struct{}{}
 		}
 	}
-	// Blocks we failed to open should all be those we are want to delete anyway.
-	for c, err := range corrupted {
-		if _, ok := deleteable[c]; !ok {
-			return errors.Wrapf(err, "unexpected corrupted block %s", c)
-		}
-	}
+	var blocksSize = int64(0)
+	var blocks []*Block
 	// Get storage blocks total size.
-	for _, dir := range dirs {
-		meta, err := readMetaFile(dir)
-		if err != nil {
-			return errors.Wrapf(err, "read meta information %s", dir)
-		}
+	for ulid, block := range goodBlocks {
 		// Don't load blocks that are scheduled for deletion.
-		if _, ok := deleteable[meta.ULID]; ok {
+		if _, ok := deleteable[ulid]; ok {
 			continue
 		}
 		// See if we already have the block in memory or open it otherwise.
-		b, ok := db.getBlock(meta.ULID)
-		if !ok {
-			b, err = OpenBlock(dir, db.chunkPool)
-			if err != nil {
-				return errors.Wrapf(err, "open block %s", dir)
-			}
-		}
-		blocks = append(blocks, b)
-		blocksSize += b.Size()
+		//b, ok := db.getBlock(ulid)
+		//if !ok {
+		//	b, err = OpenBlock(db.Dir(), db.chunkPool)
+		//	if err != nil {
+		//		return nil, nil, errors.Wrapf(err, "open block %s", db.Dir())
+		//	}
+		//}
+		blocks = append(blocks, block)
+		blocksSize += block.Size()
 	}
 	// Sort the blocks to make sure the oldest is removed first.
 	sort.Slice(blocks, func(i, j int) bool {
@@ -532,24 +568,28 @@ func (db *DB) reload() (err error) {
 			db.metrics.dataLimitDeletions.Inc()
 		}
 	}
-	tmpBlocks := blocks
-	blocks = nil
-	// Load new blocks into memory.
-	for _, block := range tmpBlocks {
-		// Don't load blocks that are scheduled for deletion.
-		if _, ok := deleteable[block.Meta().ULID]; ok {
+	db.metrics.dataLimitDeletions.Inc()
+	// Blocks we failed to open should all be those we want to delete anyway
+	for c, err := range corrupted {
+		if _, ok := deleteable[c]; !ok {
+			return nil, nil, errors.Wrapf(err, "unexpected corrupted block %s", c)
+		}
+	}
+	// Filter out blocks that aren't scheduled for deletion
+	for ulid, block := range goodBlocks {
+		if _, ok := deleteable[ulid]; ok {
 			continue
 		}
-		blocks = append(blocks, block)
-		opened[block.Meta().ULID] = struct{}{}
+		filteredBlocks = append(filteredBlocks, block)
 	}
-	sort.Slice(blocks, func(i, j int) bool {
-		return blocks[i].Meta().MinTime < blocks[j].Meta().MinTime
-	})
-	if err := validateBlockSequence(blocks); err != nil {
-		return errors.Wrap(err, "invalid block sequence")
-	}
+	return filteredBlocks, deleteable, nil
+}
 
+func (db *DB) validateBlockSequence() {
+
+}
+
+func (db *DB) removeDeleteable(blocks []*Block, deleteable map[ulid.ULID]struct{}) error {
 	// Swap in new blocks first for subsequently created readers to be seen.
 	// Then close previous blocks, which may block for pending readers to complete.
 	db.mtx.Lock()
@@ -559,29 +599,29 @@ func (db *DB) reload() (err error) {
 
 	// Drop old blocks from memory.
 	for _, b := range oldBlocks {
-		if _, ok := opened[b.Meta().ULID]; ok {
+		if containsBlockWithULID(b.Meta().ULID, blocks) {
 			continue
 		}
 		if err := b.Close(); err != nil {
 			level.Warn(db.logger).Log("msg", "closing block failed", "err", err)
 		}
 	}
-	// Delete all obsolete blocks. None of them are opened any longer.
+	//Delete all obselete blocks. None of them are opened any longer.
 	for ulid := range deleteable {
 		if err := os.RemoveAll(filepath.Join(db.dir, ulid.String())); err != nil {
-			return errors.Wrapf(err, "delete obsolete block %s", ulid)
+			return errors.Wrapf(err, "delete obsolete blocks %s", ulid)
 		}
 	}
-	db.metrics.storageBytes.Set(float64(blocksSize))
+	return nil
+}
 
-	// Garbage collect data in the head if the most recent persisted block
-	// covers data of its current time range.
-	if len(blocks) == 0 {
-		return nil
+func containsBlockWithULID(ulid ulid.ULID, blocks []*Block) bool {
+	for _, block := range blocks {
+		if block.Meta().ULID == ulid {
+			return true
+		}
 	}
-	maxt := blocks[len(blocks)-1].Meta().MaxTime
-
-	return errors.Wrap(db.head.Truncate(maxt), "head truncate failed")
+	return false
 }
 
 // validateBlockSequence returns error if given block meta files indicate that some blocks overlaps within sequence.
