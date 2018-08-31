@@ -450,10 +450,6 @@ func (db *DB) reload() (err error) {
 		db.metrics.reloads.Inc()
 	}()
 
-	//dirs, err := blockDirs(db.dir)
-	//if err != nil {
-	//	return errors.Wrap(err, "find blocks")
-	//}
 	// We delete old blocks that have been superseded by new ones by gathering all parents
 	// from existing blocks. Those parents all have newer replacements and can be safely deleted
 	// after we loaded the other blocks.
@@ -536,20 +532,11 @@ func (db *DB) filterDeleteable(goodBlocks map[ulid.ULID]*Block, corrupted map[ul
 	}
 	var blocksSize = int64(0)
 	var blocks []*Block
-	// Get storage blocks total size.
 	for ulid, block := range goodBlocks {
 		// Don't load blocks that are scheduled for deletion.
 		if _, ok := deleteable[ulid]; ok {
 			continue
 		}
-		// See if we already have the block in memory or open it otherwise.
-		//b, ok := db.getBlock(ulid)
-		//if !ok {
-		//	b, err = OpenBlock(db.Dir(), db.chunkPool)
-		//	if err != nil {
-		//		return nil, nil, errors.Wrapf(err, "open block %s", db.Dir())
-		//	}
-		//}
 		blocks = append(blocks, block)
 		blocksSize += block.Size()
 	}
