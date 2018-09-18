@@ -21,6 +21,8 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/tsdb/chunkenc"
@@ -256,7 +258,7 @@ type Block struct {
 
 // OpenBlock opens the block in the directory. It can be passed a chunk pool, which is used
 // to instantiate chunk structs.
-func OpenBlock(dir string, pool chunkenc.Pool) (*Block, error) {
+func OpenBlock(logger log.Logger, dir string, pool chunkenc.Pool) (*Block, error) {
 	meta, err := readMetaFile(dir)
 	if err != nil {
 		return nil, err
@@ -271,22 +273,7 @@ func OpenBlock(dir string, pool chunkenc.Pool) (*Block, error) {
 		return nil, err
 	}
 
-	var sz int64
-	if fInfo, err := os.Stat(filepath.Join(dir, indexFilename)); err == nil {
-		sz += fInfo.Size()
-	}
-
-	if fInfo, err := os.Stat(filepath.Join(dir, metaFilename)); err == nil {
-		sz += fInfo.Size()
-	}
-
-	if fInfo, err := os.Stat(filepath.Join(dir, "tombstones")); err == nil {
-		sz += fInfo.Size()
-	}
-	sz += cr.Size()
-	meta.Stats.NumBytes = sz
-	// Rewrite meta file with the size.
-	writeMetaFile(dir, meta)
+	updateBlockSize(logger, dir, cr, meta)
 
 	tr, err := readTombstones(dir)
 	if err != nil {
@@ -301,6 +288,34 @@ func OpenBlock(dir string, pool chunkenc.Pool) (*Block, error) {
 		tombstones: tr,
 	}
 	return pb, nil
+}
+
+// Calculates the sum for each chunk and other file that makes up each block and
+// updates the meta file
+func updateBlockSize(logger log.Logger, dir string, cr *chunks.Reader, meta *BlockMeta) error {
+	// Each of these files are included in the size of a block.
+	filesToStat := []string{filepath.Join(dir, indexFilename),
+		filepath.Join(dir, metaFilename),
+		filepath.Join(dir, "tombstones")}
+
+	var sz int64
+	for _, file := range filesToStat {
+		fInfo, err := os.Stat(file)
+		if err != nil {
+			level.Warn(logger).Log("msg", "error statting file", "file", file, "err", err)
+			return errors.Wrapf(err, "error statting file: %s", file)
+		}
+		sz += fInfo.Size()
+	}
+	sz += cr.Size()
+
+	meta.Stats.NumBytes = sz
+	// Rewrite meta file with the size.
+	err := writeMetaFile(dir, meta)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // Close closes the on-disk block. It blocks as long as there are readers reading from the block.

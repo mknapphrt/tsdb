@@ -79,9 +79,9 @@ func TestDB_reloadOrder(t *testing.T) {
 	defer db.Close()
 
 	metas := []*BlockMeta{
-		{ULID: ulid.MustNew(100, nil), MinTime: 90, MaxTime: 100, Stats: BlockStats{NumBytes: 248}},
-		{ULID: ulid.MustNew(200, nil), MinTime: 70, MaxTime: 80, Stats: BlockStats{NumBytes: 247}},
-		{ULID: ulid.MustNew(300, nil), MinTime: 100, MaxTime: 110, Stats: BlockStats{NumBytes: 249}},
+		{ULID: ulid.MustNew(100, nil), MinTime: 90, MaxTime: 100},
+		{ULID: ulid.MustNew(200, nil), MinTime: 70, MaxTime: 80},
+		{ULID: ulid.MustNew(300, nil), MinTime: 100, MaxTime: 110},
 	}
 	for _, m := range metas {
 		bdir := filepath.Join(db.Dir(), m.ULID.String())
@@ -90,6 +90,9 @@ func TestDB_reloadOrder(t *testing.T) {
 
 	testutil.Ok(t, db.reload())
 	blocks := db.Blocks()
+	blocks[0].meta.Stats.NumBytes = 0
+	blocks[1].meta.Stats.NumBytes = 0
+	blocks[2].meta.Stats.NumBytes = 0
 	testutil.Equals(t, 3, len(blocks))
 	testutil.Equals(t, *metas[1], blocks[0].Meta())
 	testutil.Equals(t, *metas[0], blocks[1].Meta())
@@ -955,9 +958,11 @@ func TestSizeBasedRetention(t *testing.T) {
 
 	// Figure out how large an empty block is.
 	emptyBlockDir := filepath.Join(db.Dir(), blocks[0].ULID.String())
-	emptyBlock, err := OpenBlock(emptyBlockDir, db.chunkPool)
+	emptyBlock, err := OpenBlock(nil, emptyBlockDir, db.chunkPool)
 	testutil.Ok(t, err)
-	db.opts.MaxBytes = 4 * emptyBlock.Size()
+
+	// Set the max bytes to be one block smaller than the current size so that a delete is prompted.
+	db.opts.MaxBytes = int64(len(blocks)-1) * emptyBlock.Size()
 
 	// Reload and ensure that actual size is less than limit.
 	testutil.Ok(t, db.reload())
@@ -966,12 +971,14 @@ func TestSizeBasedRetention(t *testing.T) {
 	for _, b := range db.blocks {
 		size += b.Size()
 	}
+
+	// Check that the size of the blocks, the number of blocks deleted, and the time of the block
 	testutil.Assert(t, size <= db.opts.MaxBytes, "actual size (%v) is expected to be less than or equal to limit (%v)", size, db.opts.MaxBytes)
-	testutil.Equals(t, 4, len(db.blocks))
+	testutil.Equals(t, len(blocks)-1, len(db.blocks))
 	testutil.Equals(t, int64(300), db.blocks[0].meta.MaxTime) // Ensure oldest block was deleted.
 
 	// Reduce the size limit and test again.
-	db.opts.MaxBytes = 1 * emptyBlock.Size()
+	db.opts.MaxBytes = emptyBlock.Size()
 	testutil.Ok(t, db.reload())
 
 	size = 0
@@ -979,6 +986,7 @@ func TestSizeBasedRetention(t *testing.T) {
 		size += b.Size()
 	}
 
+	// Check that the size of the blocks, the number of blocks deleted, and the time of the block
 	testutil.Assert(t, size <= db.opts.MaxBytes, "actual size (%v) is expected to be less than or equal to limit (%v)", size, db.opts.MaxBytes)
 	testutil.Equals(t, 1, len(db.blocks))
 	testutil.Equals(t, int64(600), db.blocks[0].meta.MaxTime) // Ensure oldest blocks were deleted.

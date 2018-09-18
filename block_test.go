@@ -50,7 +50,7 @@ func TestSetCompactionFailed(t *testing.T) {
 	testutil.Equals(t, true, b.meta.Compaction.Failed)
 	testutil.Ok(t, b.Close())
 
-	b, err = OpenBlock(tmpdir, nil)
+	b, err = OpenBlock(nil, tmpdir, nil)
 	testutil.Ok(t, err)
 	testutil.Equals(t, true, b.meta.Compaction.Failed)
 }
@@ -69,7 +69,7 @@ func createEmptyBlock(t *testing.T, dir string, meta *BlockMeta) *Block {
 
 	testutil.Ok(t, writeTombstoneFile(dir, NewMemTombstones()))
 
-	b, err := OpenBlock(dir, nil)
+	b, err := OpenBlock(nil, dir, nil)
 	testutil.Ok(t, err)
 	return b
 }
