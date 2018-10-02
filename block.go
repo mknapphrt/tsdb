@@ -259,6 +259,10 @@ type Block struct {
 // OpenBlock opens the block in the directory. It can be passed a chunk pool, which is used
 // to instantiate chunk structs.
 func OpenBlock(logger log.Logger, dir string, pool chunkenc.Pool) (*Block, error) {
+	if logger == nil {
+		logger = log.NewNopLogger()
+	}
+
 	meta, err := readMetaFile(dir)
 	if err != nil {
 		return nil, err
@@ -296,7 +300,7 @@ func updateBlockSize(logger log.Logger, dir string, cr *chunks.Reader, meta *Blo
 	// Each of these files are included in the size of a block.
 	filesToStat := []string{filepath.Join(dir, indexFilename),
 		filepath.Join(dir, metaFilename),
-		filepath.Join(dir, "tombstones")}
+		filepath.Join(dir, tombstoneFilename)}
 
 	var sz int64
 	for _, file := range filesToStat {
@@ -345,7 +349,7 @@ func (pb *Block) Dir() string { return pb.dir }
 // Meta returns meta information about the block.
 func (pb *Block) Meta() BlockMeta { return pb.meta }
 
-// Size returns the number of bytes that the block takes up
+// Size returns the number of bytes that the block takes up.
 func (pb *Block) Size() int64 { return pb.meta.Stats.NumBytes }
 
 // ErrClosing is returned when a block is in the process of being closed.

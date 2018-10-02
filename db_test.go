@@ -952,17 +952,14 @@ func TestSizeBasedRetention(t *testing.T) {
 		{ULID: ulid.MustNew(400, nil), MinTime: 400, MaxTime: 500},
 		{ULID: ulid.MustNew(500, nil), MinTime: 500, MaxTime: 600},
 	}
+
+	var emptyBlockSize int64
 	for _, m := range blocks {
-		createEmptyBlock(t, filepath.Join(db.Dir(), m.ULID.String()), m)
+		emptyBlockSize = createEmptyBlock(t, filepath.Join(db.Dir(), m.ULID.String()), m).Size()
 	}
 
-	// Figure out how large an empty block is.
-	emptyBlockDir := filepath.Join(db.Dir(), blocks[0].ULID.String())
-	emptyBlock, err := OpenBlock(nil, emptyBlockDir, db.chunkPool)
-	testutil.Ok(t, err)
-
 	// Set the max bytes to be one block smaller than the current size so that a delete is prompted.
-	db.opts.MaxBytes = int64(len(blocks)-1) * emptyBlock.Size()
+	db.opts.MaxBytes = int64(len(blocks)-1) * emptyBlockSize
 
 	// Reload and ensure that actual size is less than limit.
 	testutil.Ok(t, db.reload())
@@ -975,10 +972,10 @@ func TestSizeBasedRetention(t *testing.T) {
 	// Check that the size of the blocks, the number of blocks deleted, and the time of the block
 	testutil.Assert(t, size <= db.opts.MaxBytes, "actual size (%v) is expected to be less than or equal to limit (%v)", size, db.opts.MaxBytes)
 	testutil.Equals(t, len(blocks)-1, len(db.blocks))
-	testutil.Equals(t, int64(300), db.blocks[0].meta.MaxTime) // Ensure oldest block was deleted.
+	testutil.Equals(t, blocks[1].MaxTime, db.blocks[0].meta.MaxTime) // Ensure oldest block was deleted.
 
 	// Reduce the size limit and test again.
-	db.opts.MaxBytes = emptyBlock.Size()
+	db.opts.MaxBytes = emptyBlockSize
 	testutil.Ok(t, db.reload())
 
 	size = 0
@@ -989,7 +986,7 @@ func TestSizeBasedRetention(t *testing.T) {
 	// Check that the size of the blocks, the number of blocks deleted, and the time of the block
 	testutil.Assert(t, size <= db.opts.MaxBytes, "actual size (%v) is expected to be less than or equal to limit (%v)", size, db.opts.MaxBytes)
 	testutil.Equals(t, 1, len(db.blocks))
-	testutil.Equals(t, int64(600), db.blocks[0].meta.MaxTime) // Ensure oldest blocks were deleted.
+	testutil.Equals(t, blocks[4].MaxTime, db.blocks[0].meta.MaxTime) // Ensure oldest blocks were deleted.
 }
 
 func TestNotMatcherSelectsLabelsUnsetSeries(t *testing.T) {
