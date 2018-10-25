@@ -555,6 +555,8 @@ type Reader struct {
 	crc32 hash.Hash32
 
 	version int
+
+	dir string
 }
 
 var (
@@ -933,6 +935,11 @@ func (r *Reader) Postings(name, value string) (Postings, error) {
 // are sorted.
 func (r *Reader) SortedPostings(p Postings) Postings {
 	return p
+}
+
+// Size returns the size of an index file.
+func (r *Reader) Size() int64 {
+	return int64(r.b.Len())
 }
 
 type stringTuples struct {

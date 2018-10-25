@@ -15,8 +15,11 @@ package tsdb
 
 import (
 	"fmt"
+	"io/ioutil"
 	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"sort"
 	"testing"
 
@@ -1261,7 +1264,7 @@ func BenchmarkMergedSeriesSet(b *testing.B) {
 	} {
 		for _, j := range []int{1, 2, 4, 8, 16, 32} {
 			b.Run(fmt.Sprintf("series=%d,blocks=%d", k, j), func(b *testing.B) {
-				lbls, err := labels.ReadLabels("testdata/20kseries.json", k)
+				lbls, err := labels.ReadLabels(filepath.Join("testdata", "20kseries.json"), k)
 				testutil.Ok(b, err)
 
 				sort.Sort(labels.Slice(lbls))
@@ -1290,6 +1293,41 @@ func BenchmarkMergedSeriesSet(b *testing.B) {
 					}
 					testutil.Ok(b, ms.Err())
 					testutil.Equals(b, len(lbls), i)
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkPersistedQueries(b *testing.B) {
+	for _, nSeries := range []int{10, 100} {
+		for _, nSamples := range []int{1000, 10000, 100000} {
+			b.Run(fmt.Sprintf("series=%d,samplesPerSeries=%d", nSeries, nSamples), func(b *testing.B) {
+				dir, err := ioutil.TempDir("", "bench_persisted")
+				testutil.Ok(b, err)
+				defer os.RemoveAll(dir)
+				block := createPopulatedBlock(b, dir, nSeries, nSamples)
+				defer block.Close()
+
+				q, err := NewBlockQuerier(block, block.Meta().MinTime, block.Meta().MaxTime)
+				testutil.Ok(b, err)
+				defer q.Close()
+
+				b.ResetTimer()
+				b.ReportAllocs()
+
+				for i := 0; i < b.N; i++ {
+					ss, err := q.Select(labels.NewMustRegexpMatcher("__name__", ".+"))
+					for ss.Next() {
+						s := ss.At()
+						s.Labels()
+						it := s.Iterator()
+						for it.Next() {
+						}
+						testutil.Ok(b, it.Err())
+					}
+					testutil.Ok(b, ss.Err())
+					testutil.Ok(b, err)
 				}
 			})
 		}

@@ -326,7 +326,7 @@ func (c *LeveledCompactor) Compact(dest string, dirs ...string) (uid ulid.ULID, 
 	)
 
 	for _, d := range dirs {
-		b, err := OpenBlock(d, c.chunkPool)
+		b, err := OpenBlock(c.logger, d, c.chunkPool)
 		if err != nil {
 			return uid, err
 		}
