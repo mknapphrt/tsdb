@@ -952,7 +952,7 @@ func TestSizeRetention(t *testing.T) {
 	// Check total size, total count and check that the oldest block was deleted.
 	firstBlockSize := db.Blocks()[0].Size()
 	sizeLimit := actSize - firstBlockSize
-	db.opts.MaxBytes = sizeLimit // Set the new db size limit one byte smaller that the last block.
+	db.opts.MaxBytes = sizeLimit // Set the new db size limit one block smaller that the actual size.
 	testutil.Ok(t, db.reload())  // Reload the db to register the new db size.
 	testutil.Ok(t, db.metrics.blocksBytes.Write(metrics))
 	testutil.Ok(t, db.metrics.sizeRetentionCount.Write(metrics))
@@ -976,7 +976,7 @@ func dbDiskSize(dir string) int64 {
 	var statSize int64
 	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		// Include only index,tombstone and chunks.
-		if filepath.Dir(path) == chunkDir(filepath.Dir((filepath.Dir(path)))) ||
+		if filepath.Dir(path) == chunkDir(filepath.Dir(filepath.Dir(path))) ||
 			info.Name() == indexFilename ||
 			info.Name() == tombstoneFilename {
 			statSize += info.Size()
