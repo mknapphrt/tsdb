@@ -290,6 +290,8 @@ func OpenBlock(logger log.Logger, dir string, pool chunkenc.Pool) (*Block, error
 		return nil, err
 	}
 
+	// TODO refactor to set this at block creation time as
+	// that would be the logical place for a block size to be calculated.
 	bs := blockSize(cr, ir, tsr)
 	meta.Stats.NumBytes = bs
 	err = writeMetaFile(dir, meta)

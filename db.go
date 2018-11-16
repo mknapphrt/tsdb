@@ -132,8 +132,7 @@ type dbMetrics struct {
 	reloadsFailed        prometheus.Counter
 	compactionsTriggered prometheus.Counter
 	compactionsSkipped   prometheus.Counter
-	cutoffs              prometheus.Counter
-	cutoffsFailed        prometheus.Counter
+	timeRetentionCount   prometheus.Counter
 	startTime            prometheus.GaugeFunc
 	tombCleanTimer       prometheus.Histogram
 	blocksBytes          prometheus.Gauge
@@ -180,13 +179,9 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 		Name: "prometheus_tsdb_compactions_skipped_total",
 		Help: "Total number of skipped compactions due to disabled auto compaction.",
 	})
-	m.cutoffs = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_retention_cutoffs_total",
-		Help: "Number of times the database cut off block data from disk.",
-	})
-	m.cutoffsFailed = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_retention_cutoffs_failures_total",
-		Help: "Number of times the database failed to cut off block data from disk.",
+	m.timeRetentionCount = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_time_retentions_total",
+		Help: "The number of times that blocks were deleted because the maximum time limit was exceeded.",
 	})
 	m.startTime = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "prometheus_tsdb_lowest_timestamp",
@@ -205,10 +200,10 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 	})
 	m.blocksBytes = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "prometheus_tsdb_storage_blocks_bytes_total",
-		Help: "The number of bytes that are currently used for local storage by blocks.",
+		Help: "The number of bytes that are currently used for local storage by all blocks.",
 	})
 	m.sizeRetentionCount = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_size_limit_deletions_total",
+		Name: "prometheus_tsdb_size_retentions_total",
 		Help: "The number of times that blocks were deleted because the maximum number of bytes was exceeded.",
 	})
 
@@ -218,8 +213,7 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 			m.symbolTableSize,
 			m.reloads,
 			m.reloadsFailed,
-			m.cutoffs,
-			m.cutoffsFailed,
+			m.timeRetentionCount,
 			m.compactionsTriggered,
 			m.startTime,
 			m.tombCleanTimer,
@@ -343,53 +337,6 @@ func (db *DB) run() {
 	}
 }
 
-func (db *DB) beyondTimeRetention(meta BlockMeta) bool {
-	if db.opts.RetentionDuration == 0 {
-		return false
-	}
-
-	db.mtx.RLock()
-	blocks := db.blocks[:]
-	db.mtx.RUnlock()
-
-	if len(blocks) == 0 {
-		return false
-	}
-
-	last := blocks[len(db.blocks)-1]
-	mint := last.Meta().MaxTime - int64(db.opts.RetentionDuration)
-
-	return meta.MaxTime < mint
-}
-
-func (db *DB) beyondSizeRetention(blocks []*Block) (deleteable map[ulid.ULID]*Block) {
-	// Sort the blocks to make sure the block wiht the lowest MinTime is removed first.
-	sort.Slice(blocks, func(i, j int) bool {
-		return blocks[i].Meta().MinTime > blocks[j].Meta().MinTime
-	})
-
-	deleteable = make(map[ulid.ULID]*Block)
-
-	var blocksSize = int64(0)
-
-	for i, block := range blocks {
-		if db.opts.MaxBytes > 0 && blocksSize+block.Size() > db.opts.MaxBytes {
-			// Add this and all previous blocks for deletion.
-
-			for _, b := range blocks[i:] {
-				deleteable[b.meta.ULID] = b
-			}
-			db.metrics.sizeRetentionCount.Inc()
-			break
-		}
-		blocksSize += block.Size()
-	}
-
-	db.metrics.blocksBytes.Set(float64(blocksSize))
-
-	return deleteable
-}
-
 // Appender opens a new appender against the database.
 func (db *DB) Appender() Appender {
 	return dbAppender{db: db, Appender: db.head.Appender()}
@@ -504,7 +451,7 @@ func (db *DB) getBlock(id ulid.ULID) (*Block, bool) {
 	return nil, false
 }
 
-// reload on-disk blocks and trigger head truncation if new blocks appeared.
+// reload blocks and trigger head truncation if new blocks appeared.
 // Blocks that are obsolete due to replacement or retention will be deleted.
 func (db *DB) reload() (err error) {
 	defer func() {
@@ -527,24 +474,30 @@ func (db *DB) reload() (err error) {
 	}
 
 	// All deletable blocks should not be loaded.
-	var bb []*Block
+	var (
+		bb         []*Block
+		blocksSize int64
+	)
 	for _, block := range loadable {
 		if _, ok := deletable[block.Meta().ULID]; ok {
 			deletable[block.Meta().ULID] = block
 			continue
 		}
 		bb = append(bb, block)
+		blocksSize += block.Size()
+
 	}
 	loadable = bb
+	db.metrics.blocksBytes.Set(float64(blocksSize))
 
 	sort.Slice(loadable, func(i, j int) bool {
-		return loadable[i].Meta().MinTime < loadable[j].Meta().MinTime
+		return loadable[i].Meta().MaxTime < loadable[j].Meta().MaxTime
 	})
 	if err := validateBlockSequence(loadable); err != nil {
 		return errors.Wrap(err, "invalid block sequence")
 	}
 
-	// Swap in new blocks first for subsequently created readers to be seen.
+	// Swap new blocks first for subsequently created readers to be seen.
 	db.mtx.Lock()
 	oldBlocks := db.blocks
 	db.blocks = loadable
@@ -565,6 +518,7 @@ func (db *DB) reload() (err error) {
 	if len(loadable) == 0 {
 		return nil
 	}
+
 	maxt := loadable[len(loadable)-1].Meta().MaxTime
 
 	return errors.Wrap(db.head.Truncate(maxt), "head truncate failed")
@@ -603,33 +557,78 @@ func (db *DB) openBlocks() (blocks []*Block, corrupted map[ulid.ULID]error, err 
 // deletableBlocks returns all blocks past retention policy
 // and blocks superseded by parents after a compaction.
 func (db *DB) deletableBlocks(blocks []*Block) map[ulid.ULID]*Block {
-
 	deletable := make(map[ulid.ULID]*Block)
+
+	// Delete old blocks that have been superseded by new ones by gathering their parents.
+	// Those parents all have newer replacements and
+	// can be safely deleted after loading the other blocks.
+	// This makes it resilient against the process crashing towards the end of a compaction.
+	// Creation of a new block and deletion of its parents cannot happen atomically.
+	// By creating blocks with their parents, we can pick up the deletion where it left off during a crash.
 	for _, block := range blocks {
-		if db.beyondTimeRetention(block.Meta()) {
-			deletable[block.Meta().ULID] = block
+		for _, b := range block.Meta().Compaction.Parents {
+			deletable[b.ULID] = nil
 		}
+	}
+
+	// Sort the blocks by time - newest to oldest (largest to smallest timestamp).
+	// This ensures that the retentions will remove the oldest  blocks.
+	sort.Slice(blocks, func(i, j int) bool {
+		return blocks[i].Meta().MaxTime > blocks[j].Meta().MaxTime
+	})
+
+	for ulid, block := range db.beyondTimeRetention(blocks) {
+		deletable[ulid] = block
 	}
 
 	for ulid, block := range db.beyondSizeRetention(blocks) {
 		deletable[ulid] = block
 	}
 
-	// Delete old blocks that have been superseded by new ones by gathering all parents
-	// from existing blocks. Those parents all have newer replacements and can be safely deleted
-	// after we loaded the other blocks.
-	// This makes us resilient against the process crashing towards the end of a compaction.
-	// Creation of a new block and deletion of its parents cannot happen atomically. By creating
-	// blocks with their parents, we can pick up the deletion where it left off during a crash.
-	for _, block := range blocks {
-		for _, b := range block.Meta().Compaction.Parents {
-			if _, ok := deletable[b.ULID]; !ok {
-				deletable[b.ULID] = nil
+	return deletable
+}
+
+func (db *DB) beyondTimeRetention(blocks []*Block) (deleteable map[ulid.ULID]*Block) {
+	deleteable = make(map[ulid.ULID]*Block)
+	if len(db.blocks) == 0 || db.opts.RetentionDuration == 0 { // Time retention is disabled or no blocks to work with.
+		return
+	}
+
+	for i, block := range blocks {
+		// The difference between the first block and this block is larger than the retention period so
+		// any blocks after that are added as deleteable.
+		if i > 0 && blocks[0].Meta().MaxTime-block.Meta().MaxTime > int64(db.opts.RetentionDuration) {
+			for _, b := range blocks[i:] {
+				deleteable[b.meta.ULID] = b
 			}
+			db.metrics.timeRetentionCount.Inc()
+			break
 		}
 	}
 
-	return deletable
+	return deleteable
+}
+
+func (db *DB) beyondSizeRetention(blocks []*Block) (deleteable map[ulid.ULID]*Block) {
+	deleteable = make(map[ulid.ULID]*Block)
+	if db.opts.MaxBytes <= 0 { // Size retention is disabled.
+		return
+	}
+
+	var blocksSize = int64(0)
+	for i, block := range blocks {
+		blocksSize += block.Size()
+		if blocksSize > db.opts.MaxBytes {
+			// Add this and all following blocks for deletion.
+			for _, b := range blocks[i:] {
+				deleteable[b.meta.ULID] = b
+			}
+			db.metrics.sizeRetentionCount.Inc()
+			break
+		}
+	}
+
+	return deleteable
 }
 
 // deleteBlocks closes and deletes blocks from the disk.

@@ -77,7 +77,8 @@ func createEmptyBlock(t *testing.T, dir string, meta *BlockMeta) *Block {
 	return b
 }
 
-// createPopulatedBlock creates a block with nSeries series, filled with samples between blockMint and blockMaxt.
+// createPopulatedBlock creates a block with nSeries series,
+// filled with samples between blockMint and blockMaxt.
 func createPopulatedBlock(tb testing.TB, dir string, nSeries int, blockMint, blockMaxt int64) *Block {
 	head, err := NewHead(nil, nil, nil, 2*60*60*1000)
 	testutil.Ok(tb, err)

@@ -557,8 +557,6 @@ type Reader struct {
 	crc32 hash.Hash32
 
 	version int
-
-	dir string
 }
 
 var (
@@ -936,6 +934,11 @@ func (r *Reader) SortedPostings(p Postings) Postings {
 	return p
 }
 
+// Size returns the size of an index file.
+func (r *Reader) Size() int64 {
+	return int64(r.b.Len())
+}
+
 // LabelNames returns all the unique label names present in the index.
 func (r *Reader) LabelNames() ([]string, error) {
 	labelNamesMap := make(map[string]struct{}, len(r.labels))
@@ -958,11 +961,6 @@ func (r *Reader) LabelNames() ([]string, error) {
 	}
 	sort.Strings(labelNames)
 	return labelNames, nil
-}
-
-// Size returns the size of an index file.
-func (r *Reader) Size() int64 {
-	return int64(r.b.Len())
 }
 
 type stringTuples struct {
